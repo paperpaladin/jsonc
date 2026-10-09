@@ -337,6 +337,48 @@ rt '"\\u0000\\u001f\\"\\\\\177"'
 rt '{"":{"":{"":[]}}}'
 rt '[1e-999,-1e-999,1.7976931348623157e308]'
 
+# --- the pretty printer, against CPython's json.dumps(indent=2) ------------
+# Two independent implementations have to agree byte for byte.  Integer-valued
+# numbers only here: Python writes floats with repr() and we write the shortest
+# round-tripping %g, so 1e20 is "1e+20" to us and "1e+20" to repr but 1e15 is
+# "1e+15" to us and "1000000000000000.0" to repr.  t/diff.py compares numbers
+# under a shared rule instead.
+printf '\n--- pretty printer vs CPython json.dumps(indent=2)\n'
+pp() {
+	got=$(printf '%s' "$1" | ./jsonc -p 2>&1)
+	want=$(printf '%s' "$1" | python3 -c 'import sys, json
+print(json.dumps(json.load(sys.stdin), indent=2, ensure_ascii=False), end="")' 2>&1)
+	if [ "$got" = "$want" ]; then ok "-p agrees with json.dumps(indent=2) on $1"
+	else nok "-p agrees with json.dumps(indent=2) on $1 (got [$got] want [$want])"; fi
+}
+pp '{}'
+pp '[]'
+pp 'null'
+pp '123'
+pp '"x"'
+pp '[1,2,3]'
+pp '{"a":1}'
+pp '{"a":[1,2,{}],"b":[],"c":"x"}'
+pp '[[],{},[[]],{"k":{}}]'
+pp '{"a":{"b":{"c":{"d":[1,[2,[3]]]}}}}'
+pp '["\u0000\u001f\u007f","\"","\\","/"]'
+pp '["\u00e9\u4e2d\ud83d\ude00"]'
+pp '{"":"","  ":"\t\n\r\b\f"}'
+pp '[true,false,null,0,-1]'
+
+# Known divergence, asserted so that a change on either side is noticed:
+# CPython's json reads "-0" as the *integer* 0 and loses the sign.  We read
+# every number as a double, so -0 stays -0.  Neither is wrong (RFC 8259 says
+# nothing about signed zero) but they cannot be byte-compared, so this is the
+# one number the pretty-print comparison above leaves out.
+got=$(printf '%s' '-0' | ./jsonc -c)
+want=$(python3 -c 'import json; print(json.dumps(json.loads("-0")))')
+if [ "$got" = "-0" ] && [ "$want" = "0" ]; then
+	ok "divergence confirmed: jsonc -0 keeps the sign, CPython json gives 0"
+else
+	nok "divergence confirmed: jsonc gave $got, CPython gave $want"
+fi
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

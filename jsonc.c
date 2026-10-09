@@ -1025,8 +1025,8 @@ int main(int argc, char **argv)
 		free(buf);
 		return 1;
 	}
-	if (mode == 'c') {
-		json_write(stdout, j, 0);
+	if (mode == 'c' || mode == 'p') {
+		json_write(stdout, j, mode == 'p' ? 2 : 0);
 		fputc('\n', stdout);
 	}
 	json_free(j);
