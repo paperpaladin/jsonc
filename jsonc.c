@@ -500,6 +500,96 @@ static int parse_number(P *x, double *out)
 
 static json *parse_value(P *x);
 
+/* Takes ownership of key and val immediately, so every error path after this
+ * point is just json_free() on the object. */
+static int obj_push(P *x, json *j, char *key, size_t klen, json *val)
+{
+	if (j->u.object.len == j->u.object.cap) {
+		size_t cap = j->u.object.cap ? j->u.object.cap * 2 : 8;
+		json_member *q = realloc(j->u.object.v, cap * sizeof *q);
+		if (!q) {
+			free(key);
+			json_free(val);
+			return fail(x, JSON_ERR_NOMEM, x->p);
+		}
+		j->u.object.v = q;
+		j->u.object.cap = cap;
+	}
+	j->u.object.v[j->u.object.len].key = key;
+	j->u.object.v[j->u.object.len].klen = klen;
+	j->u.object.v[j->u.object.len].val = val;
+	j->u.object.len++;
+	return 0;
+}
+
+/* x->p is on '{'.  A member is string ':' value and nothing else: no unquoted
+ * keys, no numeric keys, no '=' instead of ':', no bare values.
+ *
+ * Duplicate keys: kept, all of them, in document order.  RFC 8259 section 4
+ * says the names SHOULD be unique and describes implementations that take the
+ * last, take the first, or report an error, so this is a choice and not a
+ * conformance question -- JSONTestSuite's y_object_duplicated_key requires
+ * that the document be *accepted*, which is the only part that is fixed.
+ * Keeping them makes the parser lossless; json_get() below returns the last
+ * match, which is what JavaScript and Python do. */
+static json *parse_object(P *x)
+{
+	json *j = node(x, JSON_OBJECT);
+	if (!j)
+		return NULL;
+	x->p++;
+	skip_ws(x);
+	if (x->p < x->end && *x->p == '}') {
+		x->p++;
+		return j;
+	}
+	for (;;) {
+		buf k;
+		json *v;
+		skip_ws(x);
+		if (parse_string(x, &k) < 0)
+			goto bad;
+		skip_ws(x);
+		if (x->p >= x->end) {
+			free(k.p);
+			fail(x, JSON_ERR_EOF, x->end);
+			goto bad;
+		}
+		if (*x->p != ':') {
+			free(k.p);
+			fail(x, JSON_ERR_COMMA, x->p);
+			goto bad;
+		}
+		x->p++;
+		skip_ws(x);
+		if (!(v = parse_value(x))) {
+			free(k.p);
+			goto bad;
+		}
+		if (obj_push(x, j, k.p, k.len, v) < 0)
+			goto bad;
+		skip_ws(x);
+		if (x->p >= x->end) {
+			fail(x, JSON_ERR_EOF, x->end);
+			goto bad;
+		}
+		if (*x->p == ',') {
+			x->p++;
+			continue;
+		}
+		if (*x->p == '}') {
+			x->p++;
+			return j;
+		}
+		fail(x, JSON_ERR_COMMA, x->p);
+		goto bad;
+	}
+bad:
+	json_free(j);
+	return NULL;
+}
+
+
 /* Doubling growth.  A failed realloc leaves the old block intact and the node
  * still owns it, so the caller's json_free() cleans up either way. */
 static int arr_push(P *x, json *j, json *v)
@@ -583,6 +673,8 @@ static json *parse_value(P *x)
 	}
 	case '[':
 		return parse_array(x);
+	case '{':
+		return parse_object(x);
 	case '-': case '0': case '1': case '2': case '3':
 	case '4': case '5': case '6': case '7': case '8': case '9': {
 		double d;
@@ -644,6 +736,44 @@ json_err json_parse(const void *buf, size_t len, json **out, size_t *errpos)
 	}
 	*out = j;
 	return JSON_OK;
+}
+
+/* ---------------------------------------------------------------- lookup --- */
+
+size_t json_len(const json *j)
+{
+	if (!j)
+		return 0;
+	if (j->type == JSON_ARRAY)
+		return j->u.array.len;
+	if (j->type == JSON_OBJECT)
+		return j->u.object.len;
+	return 0;
+}
+
+const json *json_at(const json *j, size_t i)
+{
+	if (!j || j->type != JSON_ARRAY || i >= j->u.array.len)
+		return NULL;
+	return j->u.array.v[i];
+}
+
+/* Last match wins, matching JavaScript and Python.
+ * shortcut: linear scan, so an object with a thousand keys costs a thousand
+ * memcmp per lookup; a hash index is the upgrade if anything ever calls this
+ * in a loop.  The CLI never calls it, and the tests call it a few times. */
+const json *json_get(const json *j, const char *key)
+{
+	size_t i, n;
+	const json *hit = NULL;
+	if (!j || j->type != JSON_OBJECT)
+		return NULL;
+	n = strlen(key);
+	for (i = 0; i < j->u.object.len; i++)
+		if (j->u.object.v[i].klen == n &&
+		    memcmp(j->u.object.v[i].key, key, n) == 0)
+			hit = j->u.object.v[i].val;
+	return hit;
 }
 
 /* ------------------------------------------------------------------- CLI --- */
