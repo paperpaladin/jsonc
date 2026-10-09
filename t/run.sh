@@ -379,6 +379,85 @@ else
 	nok "divergence confirmed: jsonc gave $got, CPython gave $want"
 fi
 
+# --- JSONTestSuite conformance --------------------------------------------
+# github.com/nst/JSONTestSuite, MIT, Nicolas Seriot.  Vendored as a tarball
+# under t/ so this does not need the network; see README for provenance.
+#   y_*  must be accepted
+#   n_*  must be rejected
+#   i_*  either answer is conformant, but the answer must be consistent, so
+#        ours is pinned in t/i_choices.expected and diffed.
+# Any exit status other than 0 or 1 is a crash and counts as a failure
+# whatever the filename says.
+printf '\n--- JSONTestSuite conformance (test_parsing)\n'
+CORPUS=$SCRATCH/test_parsing
+if [ ! -d "$CORPUS" ]; then
+	tar xzf t/JSONTestSuite-test_parsing.tar.gz -C "$SCRATCH" 2>/dev/null \
+		|| nok "extract t/JSONTestSuite-test_parsing.tar.gz"
+fi
+if [ ! -d "$CORPUS" ]; then
+	nok "JSONTestSuite corpus present"
+else
+	yp=0; yf=0; np=0; nf=0; ia=0; ir=0; crash=0
+	: > "$SCRATCH/i_choices.txt"
+	: > "$SCRATCH/conformance_failures.txt"
+	for f in "$CORPUS"/*.json; do
+		base=${f##*/}
+		msg=$(./jsonc "$f" 2>&1)
+		st=$?
+		if [ "$st" -ne 0 ] && [ "$st" -ne 1 ]; then
+			crash=$((crash + 1))
+			printf '%s\tEXIT %s\t%s\n' "$base" "$st" "$msg" \
+				>> "$SCRATCH/conformance_failures.txt"
+			continue
+		fi
+		case $base in
+		y_*)
+			if [ "$st" -eq 0 ]; then yp=$((yp + 1)); else
+				yf=$((yf + 1))
+				printf '%s\tWRONGLY REJECTED\t%s\n' "$base" "$msg" \
+					>> "$SCRATCH/conformance_failures.txt"
+			fi ;;
+		n_*)
+			if [ "$st" -eq 1 ]; then np=$((np + 1)); else
+				nf=$((nf + 1))
+				printf '%s\tWRONGLY ACCEPTED\t-\n' "$base" \
+					>> "$SCRATCH/conformance_failures.txt"
+			fi ;;
+		i_*)
+			if [ "$st" -eq 0 ]; then
+				ia=$((ia + 1))
+				printf '%s\taccept\n' "$base" >> "$SCRATCH/i_choices.txt"
+			else
+				ir=$((ir + 1))
+				printf '%s\treject\n' "$base" >> "$SCRATCH/i_choices.txt"
+			fi ;;
+		*)
+			nok "unexpected corpus filename $base" ;;
+		esac
+	done
+	say "SCORE y_ accepted: $yp/$((yp + yf))"
+	say "SCORE n_ rejected: $np/$((np + nf))"
+	say "SCORE i_ choices:  $((ia + ir)) made ($ia accepted, $ir rejected)"
+	if [ "$crash" -eq 0 ]; then ok "no corpus file produced an exit status outside {0,1}"
+	else nok "$crash corpus files crashed (see scratch/conformance_failures.txt)"; fi
+	if [ "$yf" -eq 0 ]; then ok "all y_ files accepted ($yp)"
+	else nok "$yf y_ files wrongly rejected"; fi
+	if [ "$nf" -eq 0 ]; then ok "all n_ files rejected ($np)"
+	else nok "$nf n_ files wrongly accepted"; fi
+	if [ -s "$SCRATCH/conformance_failures.txt" ]; then
+		printf '\nconformance failures:\n'
+		cat "$SCRATCH/conformance_failures.txt"
+	fi
+	# The i_ answers are implementation-defined but must not drift silently.
+	if [ -f t/i_choices.expected ]; then
+		if diff -u t/i_choices.expected "$SCRATCH/i_choices.txt" > "$SCRATCH/i.diff" 2>&1
+		then ok "i_ answers match t/i_choices.expected"
+		else nok "i_ answers changed"; cat "$SCRATCH/i.diff"; fi
+	else
+		nok "t/i_choices.expected missing (copy scratch/i_choices.txt)"
+	fi
+fi
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
