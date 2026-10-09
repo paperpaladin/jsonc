@@ -974,17 +974,70 @@ static char *slurp(const char *path, size_t *len)
 	}
 	if (path)
 		fclose(f);
+	/* Shrink to the exact size: with -fsanitize=address a read past the
+	 * last byte of the document is then a real heap-buffer-overflow and not
+	 * a read into the 64KB of slack that fread left behind. */
+	{
+		char *nb = realloc(buf, n ? n : 1);
+		if (nb)
+			buf = nb;
+	}
 	*len = n;
 	return buf;
 }
 
 static void usage(void)
 {
-	fputs("usage: jsonc [-p|-c] [FILE]\n"
+	fputs("usage: jsonc [-p|-c|-S] [FILE]\n"
 	      "  (no flag)  validate only: exit 0 if valid, 1 if not\n"
 	      "  -p         pretty-print (2-space indent)\n"
-	      "  -c         compact canonical serialisation\n",
+	      "  -c         compact canonical serialisation\n"
+	      "  -S         truncation sweep: parse every prefix, report the count\n",
 	      stderr);
+}
+
+/* Parse every prefix of the input and throw the results away.  Nothing about
+ * the verdicts matters -- a prefix of a valid document is usually invalid --
+ * what matters is that none of the thousands of truncated, malformed documents
+ * reads off the end of the buffer, double-frees, or leaks.  Under
+ * -fsanitize=address,undefined this is the only test in the suite that can
+ * find an out-of-bounds read, and truncation is the input shape that produces
+ * them: every "is there another byte?" check in the parser is exercised at the
+ * exact offset where the answer is no.
+ *
+ * shortcut: for inputs over 8KB the sweep steps by len/4096 instead of 1, so
+ * the two 100KB+ corpus files get 4096 cut points rather than 250001.  Every
+ * byte offset of every file under 8KB -- 315 of the 318 -- is still swept.
+ * Raising the threshold is a one-character change if it ever seems worth the
+ * minutes. */
+static void sweep(const char *buf, size_t len)
+{
+	size_t off, step = len > 8192 ? len / 4096 : 1, n = 0, acc = 0;
+
+	for (off = 0; off <= len; off += step) {
+		json *t;
+		size_t ep;
+		/* Each prefix gets its own exactly-sized allocation.  Handing
+		 * json_parse a short length into a long buffer hides every
+		 * past-the-end read from the sanitizer, because the bytes it
+		 * reads are still inside the allocation -- which is how this
+		 * sweep managed to pass with the length check in hex4() deleted.
+		 * An exact malloc turns those reads back into heap-buffer-
+		 * overflow reports. */
+		char *cut = off ? malloc(off) : NULL;
+		if (off && !cut)
+			continue;
+		if (off)
+			memcpy(cut, buf, off);
+		n++;
+		if (json_parse(cut, off, &t, &ep) == JSON_OK) {
+			acc++;
+			json_free(t);
+		}
+		free(cut);
+	}
+	printf("swept %zu prefixes of %zu bytes (step %zu), %zu accepted\n",
+	       n, len, step, acc);
 }
 
 int main(int argc, char **argv)
@@ -999,7 +1052,7 @@ int main(int argc, char **argv)
 	for (i = 1; i < argc; i++) {
 		if (argv[i][0] == '-' && argv[i][1] && !argv[i][2]) {
 			switch (argv[i][1]) {
-			case 'p': case 'c':
+			case 'p': case 'c': case 'S':
 				mode = argv[i][1];
 				continue;
 			default:
@@ -1017,6 +1070,11 @@ int main(int argc, char **argv)
 	if (!(buf = slurp(path, &len))) {
 		fprintf(stderr, "jsonc: %s: cannot read\n", path ? path : "<stdin>");
 		return 2;
+	}
+	if (mode == 'S') {
+		sweep(buf, len);
+		free(buf);
+		return 0;
 	}
 	e = json_parse(buf, len, &j, &errpos);
 	if (e != JSON_OK) {

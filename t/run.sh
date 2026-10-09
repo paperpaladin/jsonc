@@ -458,6 +458,56 @@ else
 	fi
 fi
 
+# --- the truncation sweep --------------------------------------------------
+# Every prefix of every corpus file, parsed and freed.  The verdicts are
+# meaningless; the point is that no truncated document crashes, overruns or
+# leaks.  Under `make test-asan` this is where that gets proved.
+printf '\n--- truncation sweep over the corpus\n'
+if [ -d "$CORPUS" ]; then
+	bad=0
+	total=0
+	for f in "$CORPUS"/*.json; do
+		out=$(./jsonc -S "$f" 2>&1)
+		st=$?
+		if [ "$st" -ne 0 ]; then
+			bad=$((bad + 1))
+			printf 'SWEEP FAILED exit %s: %s\n%s\n' "$st" "${f##*/}" "$out"
+		else
+			n=${out#swept }
+			total=$((total + ${n%% *}))
+		fi
+	done
+	say "SWEEP $total truncated documents parsed across 318 corpus files"
+	if [ "$bad" -eq 0 ]; then ok "every prefix of every corpus file parsed without crashing"
+	else nok "$bad corpus files crashed during the truncation sweep"; fi
+fi
+
+# Hand-written sweeps for the shapes the corpus does not contain: an escape cut
+# in half, a surrogate pair cut between the two escapes, a UTF-8 sequence cut
+# mid-continuation, and a number cut after its exponent sign.
+printf '\n--- truncation sweep over hand-written edge shapes\n'
+for s in '"\\uD83D\\uDE00"' '"\\u0041"' '"\343\201\202"' '[1e+10]' '{"a":[-0.5e-7]}' '"\\\\\\""' '[[[[[[[[[[1]]]]]]]]]]' '{"a":{"b":{"c":1}}}'; do
+	printf '%b' "$s" > "$SCRATCH/sweep.json"
+	if ./jsonc -S "$SCRATCH/sweep.json" > /dev/null 2>&1; then
+		ok "sweep $s"
+	else
+		nok "sweep $s"
+	fi
+done
+
+# --- random bytes ----------------------------------------------------------
+# Not an oracle, a smoke test: 400kB of urandom must be rejected, not crash.
+printf '\n--- hostile input\n'
+head -c 400000 /dev/urandom > "$SCRATCH/random.bin"
+./jsonc "$SCRATCH/random.bin" > /dev/null 2>&1
+st=$?
+if [ "$st" -eq 0 ] || [ "$st" -eq 1 ]; then ok "400kB of /dev/urandom: exit $st"
+else nok "400kB of /dev/urandom: exit $st"; fi
+./jsonc -S "$SCRATCH/random.bin" > /dev/null 2>&1
+st=$?
+if [ "$st" -eq 0 ]; then ok "truncation sweep over 400kB of /dev/urandom"
+else nok "truncation sweep over 400kB of /dev/urandom (exit $st)"; fi
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
