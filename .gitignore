@@ -1,0 +1,7 @@
+# build products
+jsonc
+*.o
+# test binaries
+t/unit
+# scratch: extracted conformance corpus and generated documents
+scratch/
