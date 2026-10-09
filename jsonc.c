@@ -14,7 +14,6 @@
  * recurses deeper than JSONC_MAX_DEPTH.
  */
 
-#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -400,6 +399,105 @@ bad:
 	return -1;
 }
 
+
+#define DIGIT(c) ((c) >= '0' && (c) <= '9')
+
+/* RFC 8259 section 6:
+ *   number = [ "-" ] int [ frac ] [ exp ]
+ *   int    = "0" / ( %x31-39 *DIGIT )
+ *   frac   = "." 1*DIGIT
+ *   exp    = ("e"/"E") [ "-"/"+" ] 1*DIGIT
+ *
+ * Validated by hand, then evaluated with strtod.  strtod cannot be the
+ * validator: it accepts "0x10", "inf", "nan", "+1", " 1", "1.", ".1" and
+ * "1e" (consuming just the "1"), all of which this function rejects.  It is
+ * only ever asked to convert a token this function has already proved legal.
+ */
+static int parse_number(P *x, double *out)
+{
+	const unsigned char *s = x->p, *p = s;
+	char tmp[64], *dyn = NULL, *txt, *endp;
+	size_t n;
+	double d;
+
+	if (p < x->end && *p == '-')
+		p++;
+	if (p >= x->end)
+		return fail(x, JSON_ERR_EOF, x->end);
+	if (*p == '0') {
+		p++;
+		/* "01", "00", "-01": the int production is "0" or [1-9]*DIGIT,
+		 * so a digit after a leading zero is not a longer number, it is
+		 * a syntax error.  Reporting it here rather than letting it fall
+		 * out as trailing garbage is the difference between "malformed
+		 * number at offset 1" and "trailing garbage at offset 1". */
+		if (p < x->end && DIGIT(*p))
+			return fail(x, JSON_ERR_NUMBER, p);
+	} else if (DIGIT(*p)) {
+		while (p < x->end && DIGIT(*p))
+			p++;
+	} else {
+		return fail(x, JSON_ERR_NUMBER, p);
+	}
+	if (p < x->end && *p == '.') {
+		p++;
+		if (p >= x->end || !DIGIT(*p))
+			return fail(x, p >= x->end ? JSON_ERR_EOF : JSON_ERR_NUMBER,
+				    p >= x->end ? x->end : p);
+		while (p < x->end && DIGIT(*p))
+			p++;
+	}
+	if (p < x->end && (*p == 'e' || *p == 'E')) {
+		p++;
+		if (p < x->end && (*p == '+' || *p == '-'))
+			p++;
+		if (p >= x->end || !DIGIT(*p))
+			return fail(x, p >= x->end ? JSON_ERR_EOF : JSON_ERR_NUMBER,
+				    p >= x->end ? x->end : p);
+		while (p < x->end && DIGIT(*p))
+			p++;
+	}
+
+	/* strtod needs a NUL-terminated string and the input buffer is not one.
+	 * A JSON number token has no length limit (the corpus has a 137-byte
+	 * one), so fall back to the heap for the long ones. */
+	n = (size_t)(p - s);
+	if (n < sizeof tmp) {
+		txt = tmp;
+	} else {
+		if (!(dyn = malloc(n + 1)))
+			return fail(x, JSON_ERR_NOMEM, s);
+		txt = dyn;
+	}
+	memcpy(txt, s, n);
+	txt[n] = 0;
+
+	d = strtod(txt, &endp);
+	if (endp != txt + n) {
+		/* Unreachable unless the grammar check above is wrong, so it is
+		 * worth an error rather than an assert: a mismatch means a token
+		 * we proved legal is not legal to libc. */
+		free(dyn);
+		return fail(x, JSON_ERR_NUMBER, s + (endp - txt));
+	}
+	free(dyn);
+
+	/* Policy: a token that overflows to +-infinity is rejected.  RFC 8259
+	 * section 6 permits either answer ("such software is expected to use
+	 * ... IEEE 754 binary64") and JSONTestSuite files it under i_, so the
+	 * requirement is only to be consistent and say which.  Rejecting keeps
+	 * the serialiser total: every tree that parses can be written back out
+	 * as valid JSON, which is not true if infinities can live in it.
+	 * Underflow is NOT an error: 1e-999 is 0.0 and loses only precision,
+	 * the same way 123456789012345678901 does. */
+	if (isinf(d))
+		return fail(x, JSON_ERR_RANGE, s);
+
+	x->p = p;
+	*out = d;
+	return 0;
+}
+
 static json *parse_value(P *x);
 
 static json *parse_value(P *x)
@@ -420,6 +518,15 @@ static json *parse_value(P *x)
 		}
 		j->u.string.p = b.p;
 		j->u.string.len = b.len;
+		return j;
+	}
+	case '-': case '0': case '1': case '2': case '3':
+	case '4': case '5': case '6': case '7': case '8': case '9': {
+		double d;
+		if (parse_number(x, &d) < 0)
+			return NULL;
+		if ((j = node(x, JSON_NUMBER)))
+			j->u.number = d;
 		return j;
 	}
 	case 'n':
