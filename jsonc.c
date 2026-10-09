@@ -671,10 +671,23 @@ static json *parse_value(P *x)
 		j->u.string.len = b.len;
 		return j;
 	}
+	/* The depth counter lives here rather than inside parse_array and
+	 * parse_object so that there is exactly one increment, one decrement and
+	 * one check for both containers.  Without it this function is a textbook
+	 * stack overflow: the corpus ships a 100000-deep document whose only
+	 * purpose is to crash recursive-descent parsers, and a SIGSEGV is not a
+	 * rejection.  JSONC_MAX_DEPTH frames of parse_value is a few hundred
+	 * kilobytes of stack even under -fsanitize=address. */
 	case '[':
-		return parse_array(x);
 	case '{':
-		return parse_object(x);
+		if (x->depth >= JSONC_MAX_DEPTH) {
+			fail(x, JSON_ERR_DEPTH, x->p);
+			return NULL;
+		}
+		x->depth++;
+		j = *x->p == '[' ? parse_array(x) : parse_object(x);
+		x->depth--;
+		return j;
 	case '-': case '0': case '1': case '2': case '3':
 	case '4': case '5': case '6': case '7': case '8': case '9': {
 		double d;

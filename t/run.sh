@@ -244,6 +244,38 @@ rej '{{}}'                        'object as a key'
 rej '{"a":1}}'                    'extra close brace'
 rej '[{]'                         'unclosed object inside an array'
 
+# --- the depth limit -------------------------------------------------------
+# A crash is not a rejection, so these check the exit status exactly: 1 means
+# "rejected", 134/139 would mean abort/segfault and must fail the suite.
+printf '\n--- depth limit (JSONC_MAX_DEPTH)\n'
+rep() { # rep <open> <n> <close> [innermost]
+	python3 -c 'import sys
+o, n, c = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+sys.stdout.write(o * n + (sys.argv[4] if len(sys.argv) > 4 else "") + c * n)' "$@"
+}
+depth_ok() { # depth_ok <open> <close> <n> <label>
+	if rep "$1" "$3" "$2" "${5:-}" | ./jsonc 2>/dev/null; then ok "accept $4"
+	else nok "accept $4"; fi
+}
+depth_rej() { # depth_rej <open> <close> <n> <label>
+	rep "$1" "$3" "$2" "${5:-}" | ./jsonc 2>/dev/null
+	st=$?
+	if [ "$st" -eq 1 ]; then ok "reject $4 (exit 1)"
+	else nok "reject $4 (exit $st, wanted 1)"; fi
+}
+depth_ok  '[' ']' 999    '999 nested arrays'
+depth_ok  '[' ']' 1000   '1000 nested arrays, exactly at the limit'
+depth_rej '[' ']' 1001   '1001 nested arrays'
+depth_rej '[' ']' 100000 '100000 nested arrays'
+depth_rej '[' ']' 1000000 '1000000 nested arrays'
+depth_ok  '{"a":' '}' 999  '999 nested objects' 1
+depth_rej '{"a":' '}' 1001 '1001 nested objects' 1
+depth_rej '{"a":' '}' 100000 '100000 nested objects' 1
+printf '[%.0s' $(seq 1 100000) | ./jsonc 2>/dev/null
+st=$?
+if [ "$st" -eq 1 ]; then ok "reject 100000 unclosed '[' (exit 1)"
+else nok "reject 100000 unclosed '[' (exit $st, wanted 1)"; fi
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
