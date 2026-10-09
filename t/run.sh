@@ -24,6 +24,18 @@ printf '=== building (CC=%s)\n' "$CC"
 # shellcheck disable=SC2086
 $CC $CFLAGS -o ./jsonc jsonc.c -lm || { nok "compile jsonc"; }
 
+# --- the API that the CLI cannot reach -------------------------------------
+# Error codes, byte offsets, embedded NUL, duplicate-key lookup, the depth
+# limit as a return value, and json_write into memory.  t/unit.c includes
+# jsonc.c directly with JSONC_NO_MAIN.
+printf '\n--- unit tests (t/unit.c)\n'
+# shellcheck disable=SC2086
+if $CC $CFLAGS -o ./t/unit t/unit.c -lm; then
+	./t/unit 2>&1 | tee -a "$OUT"
+else
+	nok "compile t/unit"
+fi
+
 # --- hand-written accept/reject table --------------------------------------
 # These duplicate a few JSONTestSuite cases on purpose: when the corpus is
 # missing this section still fails if the parser breaks.

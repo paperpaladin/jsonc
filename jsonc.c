@@ -727,7 +727,9 @@ json_err json_parse(const void *buf, size_t len, json **out, size_t *errpos)
 	P x;
 	json *j;
 
-	x.b = x.p = (const unsigned char *)buf;
+	/* NULL with len 0 is a legitimate call and `NULL + 0` is undefined
+	 * behaviour that UBSan reports, so substitute a real address. */
+	x.b = x.p = buf ? (const unsigned char *)buf : (const unsigned char *)"";
 	x.end = x.b + len;
 	x.depth = 0;
 	x.err = JSON_OK;
