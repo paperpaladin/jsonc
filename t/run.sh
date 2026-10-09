@@ -391,6 +391,23 @@ else
 	nok "divergence confirmed: jsonc gave $got, CPython gave $want"
 fi
 
+# --- the error message ------------------------------------------------------
+# Byte offsets alone print as "jsonc: file:1000: nesting too deep", which
+# reads as a line number.  Line:column plus the byte offset in brackets.
+printf '\n--- error messages\n'
+msgcheck() { # msgcheck <input> <expected stderr tail>
+	got=$(printf '%b' "$1" | ./jsonc 2>&1 >/dev/null)
+	want="jsonc: <stdin>:$2"
+	if [ "$got" = "$want" ]; then ok "message for $1"
+	else nok "message for $1: got [$got] want [$want]"; fi
+}
+msgcheck '{"a":1,}'          '1:8: unexpected token (byte 7)'
+msgcheck '[1,\n2 3]'         '2:3: expected '"'"','"'"' or '"'"':'"'"' (byte 6)'
+msgcheck '{\n  "a": 01\n}'   '2:9: malformed number (byte 10)'
+msgcheck '\n\n\n"\\q"'        '4:3: malformed string (byte 5)'
+msgcheck '1e999'             '1:1: number out of range for double (byte 0)'
+msgcheck ''                  '1:1: unexpected end of input (byte 0)'
+
 # --- JSONTestSuite conformance --------------------------------------------
 # github.com/nst/JSONTestSuite, MIT, Nicolas Seriot.  Vendored as a tarball
 # under t/ so this does not need the network; see README for provenance.

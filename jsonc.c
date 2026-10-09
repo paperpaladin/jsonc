@@ -1080,8 +1080,23 @@ int main(int argc, char **argv)
 	}
 	e = json_parse(buf, len, &j, &errpos);
 	if (e != JSON_OK) {
-		fprintf(stderr, "jsonc: %s:%zu: %s\n", path ? path : "<stdin>",
-			errpos, json_strerror(e));
+		/* "jsonc: file:1000: nesting too deep" reads as line 1000 and is
+		 * a byte offset, which is the sort of message that wastes an
+		 * afternoon.  Report line and column, and keep the offset in
+		 * brackets because it is the only coordinate the API returns and
+		 * the only one that is useful to `dd`. */
+		size_t line = 1, col = 1, i;
+		for (i = 0; i < errpos && i < len; i++) {
+			if (buf[i] == '\n') {
+				line++;
+				col = 1;
+			} else {
+				col++;
+			}
+		}
+		fprintf(stderr, "jsonc: %s:%zu:%zu: %s (byte %zu)\n",
+			path ? path : "<stdin>", line, col, json_strerror(e),
+			errpos);
 		free(buf);
 		return 1;
 	}
