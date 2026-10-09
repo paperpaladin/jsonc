@@ -100,6 +100,27 @@ rej '"\360\237\230"'              'truncated 4-byte sequence'
 rej '"\\uD800"'                   'lone high surrogate escape'
 rej '"\\uDC00"'                   'lone low surrogate escape'
 
+# --- surrogate pairs -------------------------------------------------------
+printf '\n--- surrogate pairs\n'
+acc '"\\uD83D\\uDE00"'            'surrogate pair for U+1F600'
+acc '"\\ud83d\\ude00"'            'surrogate pair, lowercase hex'
+acc '"\\uD800\\uDC00"'            'lowest pair, U+10000'
+acc '"\\uDBFF\\uDFFF"'            'highest pair, U+10FFFF'
+acc '"a\\uD83D\\uDE00b"'          'pair surrounded by ASCII'
+acc '"\\uD83D\\uDE00\\uD83D\\uDE00"' 'two pairs back to back'
+rej '"\\uD800"'                   'high surrogate alone'
+rej '"\\uDBFF"'                   'highest high surrogate alone'
+rej '"\\uDC00"'                   'low surrogate alone'
+rej '"\\uDFFF"'                   'highest low surrogate alone'
+rej '"\\uD800\\uD800"'            'two high surrogates'
+rej '"\\uDC00\\uDC00"'            'two low surrogates'
+rej '"\\uDC00\\uD800"'            'reversed pair'
+rej '"\\uD800\\u0041"'            'high surrogate then a BMP escape'
+rej '"\\uD800x"'                  'high surrogate then a literal'
+rej '"\\uD800\\n"'                'high surrogate then another escape'
+rej '"\\uD800"'                   'high surrogate then end of string'
+rej '"\\uD800\\uDC0"'             'pair with a short second escape'
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

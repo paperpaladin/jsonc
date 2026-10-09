@@ -334,13 +334,36 @@ static int parse_string(P *x, buf *b)
 			case 'u':
 				if (hex4(x, &cp) < 0)
 					goto bad;
-				/* shortcut: every surrogate is rejected here.  The
-				 * pairing rule is the next commit; until then a
-				 * legal astral-plane escape is an error, which is wrong
-				 * but not unsafe. */
-				if (cp >= 0xd800 && cp <= 0xdfff) {
+				/* UTF-16 leaks into JSON here and nowhere else: a
+				 * codepoint above U+FFFF can only be written as a
+				 * surrogate pair, so a high surrogate *must* be
+				 * followed by \uDC00-\uDFFF and a low surrogate can
+				 * never stand alone.  Anything else is an unpaired
+				 * surrogate, which is not a Unicode scalar value and
+				 * therefore cannot be encoded as UTF-8 at all.  The
+				 * popular wrong answers are to emit CESU-8, to emit
+				 * U+FFFD, or to emit the raw 0xED 0xA0 0x80 form that
+				 * copy_utf8() above refuses to read back. */
+				if (cp >= 0xdc00 && cp <= 0xdfff) {
 					fail(x, JSON_ERR_SURROGATE, esc);
 					goto bad;
+				}
+				if (cp >= 0xd800 && cp <= 0xdbff) {
+					unsigned lo;
+					if ((size_t)(x->end - x->p) < 6 ||
+					    x->p[0] != '\\' || x->p[1] != 'u') {
+						fail(x, JSON_ERR_SURROGATE, esc);
+						goto bad;
+					}
+					x->p += 2;
+					if (hex4(x, &lo) < 0)
+						goto bad;
+					if (lo < 0xdc00 || lo > 0xdfff) {
+						fail(x, JSON_ERR_SURROGATE, esc);
+						goto bad;
+					}
+					cp = 0x10000 + ((cp - 0xd800) << 10) +
+					     (lo - 0xdc00);
 				}
 				if (encode_utf8(x, b, cp) < 0)
 					goto bad;
