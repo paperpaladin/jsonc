@@ -276,6 +276,67 @@ st=$?
 if [ "$st" -eq 1 ]; then ok "reject 100000 unclosed '[' (exit 1)"
 else nok "reject 100000 unclosed '[' (exit $st, wanted 1)"; fi
 
+# --- the serialiser: compact canonical form --------------------------------
+printf '\n--- serialiser (-c)\n'
+ser() { # ser <input> <expected-output>
+	got=$(printf '%b' "$1" | ./jsonc -c 2>&1)
+	want=$(printf '%b' "$2")
+	if [ "$got" = "$want" ]; then ok "-c $1 -> $2"
+	else nok "-c $1 -> $2 (got $got)"; fi
+}
+ser 'null'              'null'
+ser 'true'              'true'
+ser '  false  '         'false'
+ser '0'                 '0'
+ser '-0'                '-0'
+ser '1'                 '1'
+ser '1.0'               '1'
+ser '1e2'               '100'
+ser '100'               '100'
+ser '1e15'              '1e+15'
+ser '1e16'              '1e+16'
+ser '12345678901234567890' '1.2345678901234567e+19'
+ser '1e20'              '1e+20'
+ser '0.1'               '0.1'
+ser '0.3'               '0.3'
+ser '1.7976931348623157e308' '1.7976931348623157e+308'
+ser '5e-324'            '5e-324'
+ser '1e-999'            '0'
+ser '"abc"'             '"abc"'
+ser '""'                '""'
+ser '"\\u0041"'         '"A"'
+ser '"\\u00e9"'         '"\303\251"'
+ser '"\\uD83D\\uDE00"'  '"\360\237\230\200"'
+ser '"\360\237\230\200"' '"\360\237\230\200"'
+ser '"a\\nb"'           '"a\\nb"'
+ser '"a\\u0000b"'       '"a\\u0000b"'
+ser '"a\\u001fb"'       '"a\\u001fb"'
+ser '"\\b\\f\\n\\r\\t"' '"\\b\\f\\n\\r\\t"'
+ser '"\\/"'             '"/"'
+ser '"\\""'             '"\\""'
+ser '"\177"'            '"\177"'
+ser '[]'                '[]'
+ser '{}'                '{}'
+ser '[ 1 , 2 ]'         '[1,2]'
+ser '{ "a" : 1 }'       '{"a":1}'
+ser '{"a":1,"a":2}'     '{"a":1,"a":2}'
+ser '[[],{},null]'      '[[],{},null]'
+ser '{"a":[1,{"b":[]}]}' '{"a":[1,{"b":[]}]}'
+
+# --- round-trip: -c output must re-parse to itself -------------------------
+printf '\n--- round-trip (parse -> write -> parse -> write)\n'
+rt() {
+	a=$(printf '%b' "$1" | ./jsonc -c 2>&1)
+	b=$(printf '%s' "$a" | ./jsonc -c 2>&1)
+	if [ "$a" = "$b" ] && [ -n "$a" ]; then ok "round-trip $1"
+	else nok "round-trip $1 (first $a, second $b)"; fi
+}
+rt '{"a":[1,2,{"b":"\\u00e9\\uD83D\\uDE00"}],"c":[-0,1e20,0.1,5e-324]}'
+rt '[[[[[[[[[[1]]]]]]]]]]'
+rt '"\\u0000\\u001f\\"\\\\\177"'
+rt '{"":{"":{"":[]}}}'
+rt '[1e-999,-1e-999,1.7976931348623157e308]'
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

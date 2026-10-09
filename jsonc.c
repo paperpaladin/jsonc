@@ -789,6 +789,149 @@ const json *json_get(const json *j, const char *key)
 	return hit;
 }
 
+/* ------------------------------------------------------------ serialiser --- */
+
+/* Canonical number form: of the 17 candidate spellings "%.1g" ... "%.17g",
+ * keep the SHORTEST one that reads back as the same double.
+ *
+ * Neither half of that is optional.  "%.17g" always round-trips but prints 0.1
+ * as "0.10000000000000001" and 100 as "100.00000000000000".  Taking the first
+ * precision that round-trips instead of the shortest result prints 100 as
+ * "1e+02", because %g switches to exponential notation when the decimal
+ * exponent is >= the precision -- so the style depends on the precision and
+ * not just on the value.  Comparing the strings fixes both: 100 -> "100",
+ * 0.1 -> "0.1", 1e20 -> "1e+20", DBL_MIN_DENORM -> "5e-324".
+ *
+ * This is a definition, not a discovery, and the differential oracle in
+ * t/diff.py implements the same four lines in Python so the two can compare
+ * serialised text instead of parsed values.
+ *
+ * shortcut: 17 snprintf plus 17 strtod per number, which is maybe 2us.  A
+ * Ryu or Grisu shortest-float printer is the upgrade if anyone ever
+ * serialises enough numbers to notice; -c on the whole 354KB corpus takes
+ * well under a second as it is. */
+static void write_number(FILE *f, double d)
+{
+	char best[48], cand[48];
+	int p;
+
+	best[0] = 0;
+	for (p = 1; p <= 17; p++) {
+		snprintf(cand, sizeof cand, "%.*g", p, d);
+		if (strtod(cand, NULL) != d)
+			continue;
+		if (!best[0] || strlen(cand) < strlen(best))
+			memcpy(best, cand, strlen(cand) + 1);
+	}
+	/* best[0] is always set: %.17g round-trips by construction. */
+	fputs(best, f);
+}
+
+/* RFC 8259 section 7 requires escaping only '"', '\' and %x00-1F.  Everything
+ * else goes out as it came in, which means valid UTF-8 stays valid UTF-8 and
+ * the output is byte-identical to the input for the common case.  '/' is NOT
+ * escaped (legal either way, and escaping it is a HTML-in-JSON habit), DEL is
+ * not escaped, and no \u escape is emitted for anything above U+001F, so
+ * serialise(parse(s)) never produces a surrogate pair we would then have to
+ * read back. */
+static void write_string(FILE *f, const char *s, size_t n)
+{
+	size_t i;
+	fputc('"', f);
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+		switch (c) {
+		case '"':  fputs("\\\"", f); break;
+		case '\\': fputs("\\\\", f); break;
+		case '\b': fputs("\\b", f); break;
+		case '\f': fputs("\\f", f); break;
+		case '\n': fputs("\\n", f); break;
+		case '\r': fputs("\\r", f); break;
+		case '\t': fputs("\\t", f); break;
+		default:
+			if (c < 0x20)
+				fprintf(f, "\\u%04x", c);
+			else
+				fputc(c, f);
+		}
+	}
+	fputc('"', f);
+}
+
+static void nl_indent(FILE *f, int indent, int level)
+{
+	int i;
+	if (!indent)
+		return;
+	fputc('\n', f);
+	for (i = 0; i < indent * level; i++)
+		fputc(' ', f);
+}
+
+static void write_value(FILE *f, const json *j, int indent, int level)
+{
+	size_t i;
+
+	switch (j->type) {
+	case JSON_NULL:
+		fputs("null", f);
+		break;
+	case JSON_BOOL:
+		fputs(j->u.boolean ? "true" : "false", f);
+		break;
+	case JSON_NUMBER:
+		write_number(f, j->u.number);
+		break;
+	case JSON_STRING:
+		write_string(f, j->u.string.p, j->u.string.len);
+		break;
+	case JSON_ARRAY:
+		/* An empty container stays on one line even when indenting,
+		 * which is what json.dumps(indent=2) does, and the pretty
+		 * printer is compared against it byte for byte. */
+		if (!j->u.array.len) {
+			fputs("[]", f);
+			break;
+		}
+		fputc('[', f);
+		for (i = 0; i < j->u.array.len; i++) {
+			if (i)
+				fputc(',', f);
+			nl_indent(f, indent, level + 1);
+			write_value(f, j->u.array.v[i], indent, level + 1);
+		}
+		nl_indent(f, indent, level);
+		fputc(']', f);
+		break;
+	case JSON_OBJECT:
+		if (!j->u.object.len) {
+			fputs("{}", f);
+			break;
+		}
+		fputc('{', f);
+		for (i = 0; i < j->u.object.len; i++) {
+			if (i)
+				fputc(',', f);
+			nl_indent(f, indent, level + 1);
+			write_string(f, j->u.object.v[i].key,
+				     j->u.object.v[i].klen);
+			fputs(indent ? ": " : ":", f);
+			write_value(f, j->u.object.v[i].val, indent, level + 1);
+		}
+		nl_indent(f, indent, level);
+		fputc('}', f);
+		break;
+	}
+}
+
+/* indent == 0 is the compact canonical form: no space anywhere outside a
+ * string.  indent > 0 pretty-prints with that many spaces per level. */
+void json_write(FILE *f, const json *j, int indent)
+{
+	if (j)
+		write_value(f, j, indent, 0);
+}
+
 /* ------------------------------------------------------------------- CLI --- */
 
 #ifndef JSONC_NO_MAIN
@@ -882,7 +1025,10 @@ int main(int argc, char **argv)
 		free(buf);
 		return 1;
 	}
-	(void)mode;
+	if (mode == 'c') {
+		json_write(stdout, j, 0);
+		fputc('\n', stdout);
+	}
 	json_free(j);
 	free(buf);
 	return 0;
