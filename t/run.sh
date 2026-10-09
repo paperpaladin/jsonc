@@ -527,6 +527,46 @@ else nok "truncation sweep over 400kB of /dev/urandom (exit $st)"; fi
 printf '\n--- differential oracle vs CPython json (t/diff.py)\n'
 python3 t/diff.py ./jsonc "$CORPUS" 2>&1 | tee -a "$OUT"
 
+# --- valgrind (only when asked: `make test-valgrind`) ----------------------
+# ASan and valgrind find overlapping but not identical things, and valgrind
+# needs an uninstrumented binary, which is why this is a separate target
+# rather than part of the default run.  t/unit exercises every free path in
+# one process; the -S runs are where a read of uninitialised or freed memory
+# would show up.
+if [ "${JSONC_VALGRIND:-}" = 1 ]; then
+	printf '\n--- valgrind\n'
+	VG="valgrind --error-exitcode=9 --leak-check=full --errors-for-leak-kinds=all -q"
+	if $VG ./t/unit > /dev/null 2>"$SCRATCH/vg.err" && [ ! -s "$SCRATCH/vg.err" ]; then
+		ok "valgrind clean on t/unit"
+	else
+		nok "valgrind on t/unit"; cat "$SCRATCH/vg.err"
+	fi
+	for f in n_structure_100000_opening_arrays.json \
+		 n_structure_open_array_object.json \
+		 i_structure_500_nested_arrays.json \
+		 y_object_duplicated_key.json \
+		 y_string_utf8.json \
+		 y_string_accepted_surrogate_pairs.json \
+		 i_string_truncated-utf-8.json; do
+		if [ ! -f "$CORPUS/$f" ]; then
+			nok "valgrind: corpus file $f is missing, test skipped"
+			continue
+		fi
+		if $VG ./jsonc -S "$CORPUS/$f" > /dev/null 2>"$SCRATCH/vg.err" \
+			&& [ ! -s "$SCRATCH/vg.err" ]; then
+			ok "valgrind clean sweeping $f"
+		else
+			nok "valgrind sweeping $f"; cat "$SCRATCH/vg.err"
+		fi
+	done
+	if $VG ./jsonc -S "$SCRATCH/random.bin" > /dev/null 2>"$SCRATCH/vg.err" \
+		&& [ ! -s "$SCRATCH/vg.err" ]; then
+		ok "valgrind clean sweeping 400kB of /dev/urandom"
+	else
+		nok "valgrind sweeping random bytes"; cat "$SCRATCH/vg.err"
+	fi
+fi
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
