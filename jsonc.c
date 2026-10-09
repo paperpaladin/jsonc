@@ -500,6 +500,67 @@ static int parse_number(P *x, double *out)
 
 static json *parse_value(P *x);
 
+/* Doubling growth.  A failed realloc leaves the old block intact and the node
+ * still owns it, so the caller's json_free() cleans up either way. */
+static int arr_push(P *x, json *j, json *v)
+{
+	if (j->u.array.len == j->u.array.cap) {
+		size_t cap = j->u.array.cap ? j->u.array.cap * 2 : 8;
+		json **q = realloc(j->u.array.v, cap * sizeof *q);
+		if (!q) {
+			json_free(v);
+			return fail(x, JSON_ERR_NOMEM, x->p);
+		}
+		j->u.array.v = q;
+		j->u.array.cap = cap;
+	}
+	j->u.array.v[j->u.array.len++] = v;
+	return 0;
+}
+
+/* x->p is on '['.  The empty array is special-cased because "[]" is legal and
+ * "[,]" and "[1,]" are not: after a comma a value is mandatory, which falls
+ * out of calling parse_value() unconditionally. */
+static json *parse_array(P *x)
+{
+	json *j = node(x, JSON_ARRAY);
+	if (!j)
+		return NULL;
+	x->p++;
+	skip_ws(x);
+	if (x->p < x->end && *x->p == ']') {
+		x->p++;
+		return j;
+	}
+	for (;;) {
+		json *v;
+		skip_ws(x);
+		if (!(v = parse_value(x)))
+			goto bad;
+		if (arr_push(x, j, v) < 0)
+			goto bad;
+		skip_ws(x);
+		if (x->p >= x->end) {
+			fail(x, JSON_ERR_EOF, x->end);
+			goto bad;
+		}
+		if (*x->p == ',') {
+			x->p++;
+			continue;
+		}
+		if (*x->p == ']') {
+			x->p++;
+			return j;
+		}
+		fail(x, JSON_ERR_COMMA, x->p);
+		goto bad;
+	}
+bad:
+	json_free(j);
+	return NULL;
+}
+
+
 static json *parse_value(P *x)
 {
 	json *j;
@@ -520,6 +581,8 @@ static json *parse_value(P *x)
 		j->u.string.len = b.len;
 		return j;
 	}
+	case '[':
+		return parse_array(x);
 	case '-': case '0': case '1': case '2': case '3':
 	case '4': case '5': case '6': case '7': case '8': case '9': {
 		double d;
