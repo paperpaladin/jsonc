@@ -80,39 +80,86 @@ Ranked by how little we control them.
       why: an accept/reject harness has to exist before anything can be scored
       against it, and `null`/`true`/`false` is enough grammar to test the
       framing, the whitespace set and the trailing-garbage rule.
-- [ ] `strings: the escape set, bare control characters, UTF-8 validation`
-      why: strings are where the corpus concentrates its failures (90 of the
-      318 files), and the decoder has to be right before surrogates make sense.
-- [ ] `surrogate pairs, and lone surrogates rejected`
-      why: the single most common real-parser bug in the suite; needs the
-      escape decoder in place first.
-- [ ] `numbers: the RFC grammar by hand, strtod for the value`
-      why: `strtod` accepts `0x10`, `inf`, `nan`, leading `+` and whitespace,
-      so it cannot be the validator -- only the evaluator.
-- [ ] `arrays`
-      why: first recursive production; needs a value parser to recurse into.
-- [ ] `objects, duplicate keys kept in order`
-      why: second recursive production, and the duplicate-key policy has to be
+      watched failing: isspace(3) in place of the four RFC ws bytes, 2 failures.
+- [x] `strings: the escape set, bare control characters, UTF-8 validation`
+      why: strings are where the corpus concentrates its failures, and the
+      decoder has to be right before surrogates make sense.
+- [x] `surrogate pairs, and lone surrogates rejected`
+      why: the single most common real-parser bug in the suite.
+- [x] `numbers: the RFC grammar by hand, strtod only for the value`
+      why: strtod accepts 0x10, inf, nan, leading + and whitespace, and on
+      "1e" silently consumes just the "1", so it cannot be the validator.
+- [x] `arrays`
+      why: first recursive production.
+- [x] `objects, duplicate keys kept in document order`
+      why: second recursive production, and the duplicate-key policy had to be
       decided here rather than discovered later.
-- [ ] `the depth limit`
-      why: the corpus contains a 100000-deep document specifically to crash
-      recursive-descent parsers, and a crash is not a rejection.
-- [ ] `the serialiser: compact, with shortest round-tripping numbers`
-      why: `%.17g` round-trips but prints `0.10000000000000001`; the shortest
-      form that still round-trips is what the differential oracle can match.
-- [ ] `the pretty printer and the CLI flags`
-      why: `-p` output is byte-comparable with `json.dumps(indent=2)`, which
-      makes the pretty printer oracle-checked rather than eyeballed.
-- [ ] `the conformance runner over vendored JSONTestSuite`
-      why: this is the project.  Everything before it is unverified.
-- [ ] one commit per class of failure the corpus finds
-      why: each is a real bug with a named external file as its reproducer.
-- [ ] `the truncation sweep`
-      why: every prefix of every corpus file is 70k malformed documents we did
-      not have to invent, and it is what `make test-asan` is for.
-- [ ] `the CPython differential oracle`
-      why: a second independent implementation, over generated documents and
-      the edge cases the corpus does not cover (very long strings, deep but
-      legal nesting, doubles at the edge of the format).
-- [ ] `README and PLAN: publish the score, including the failures`
-      why: a README that lists only successes is not finished.
+- [x] `the depth limit: a 1000000-deep document is an error, not a SIGSEGV`
+      why: the corpus ships a 100000-deep document to crash recursive-descent
+      parsers, and a crash is not a rejection.
+      watched failing: -DJSONC_MAX_DEPTH=100000000 gives exit 139.
+- [x] `the serialiser: compact canonical form, shortest round-tripping numbers`
+      why: %.17g round-trips and prints 0.1 as 0.10000000000000001; the
+      shortest spelling that round-trips is what a differential oracle can
+      compare as text.
+- [x] `the pretty printer and the CLI flags`
+      why: -p output is byte-comparable with json.dumps(indent=2), so the
+      pretty printer is oracle-checked rather than eyeballed.  Found the
+      signed-zero divergence immediately.
+- [x] `the conformance runner over vendored JSONTestSuite: 95/95, 188/188`
+      why: this is the project.  Everything before it was unverified.
+      watched failing: a trailing comma allowed in parse_array, 186/188.
+- [x] `the truncation sweep, and the harness bug that made it blind`
+      why: every prefix of every corpus file is 12605 malformed documents we
+      did not have to invent.
+      watched failing: hex4's length check removed produced a CLEAN sanitizer
+      run until slurp stopped over-allocating.  The real bug of the project.
+- [x] `the CPython differential oracle: 23 pinned divergences`
+      why: a second independent implementation, over the corpus, 120 generated
+      documents and a named edge battery.
+      watched failing: write_number pinned to 17 digits, 5 value mismatches.
+- [x] `t/unit.c: the API the CLI cannot reach`
+      why: the CLI answers one bit, so error codes, byte offsets, embedded
+      NUL, duplicate-key lookup and json_write are invisible from a shell.
+      found: json_parse(NULL, 0) computed NULL + 0, reported by UBSan.
+- [x] `make test-valgrind: a second memory oracle, and no silent skips`
+      why: the target set JSONC_VALGRIND=1 and t/run.sh never read it, so for
+      thirteen commits it rebuilt and then ran the ordinary suite.
+- [x] `error messages: line and column, with the byte offset in brackets`
+      why: "file:1000: nesting too deep" reads as a line number and is a byte
+      offset.  Also records the unrepro reproducibility verdict.
+- [x] `README: publish the score, the 23 divergences, and what is broken`
+      why: a README that only lists successes is not finished.
+- [x] `PLAN: record the final state`
+
+Next, in order:
+
+- [ ] `an arena allocator behind json_parse`
+      why: one calloc per node means a 100k-element array is 100k small
+      allocations and json_free is 100k frees.  An arena makes the free path a
+      single call, which also deletes every partial-free path in the error
+      handling -- the place where a leak would hide.  Measure first: nothing
+      here is currently performance-bound, so this is only worth doing if
+      `-S` on the corpus is dominated by malloc, which has not been checked.
+- [ ] `locale independence, or an explicit refusal`
+      why: the one limitation in the README that is asserted from the spec
+      rather than demonstrated, because no comma-decimal locale is installed.
+      Either install one and add the test, or parse and print the decimal
+      digits directly and stop calling strtod and snprintf at all.  The second
+      is more code and removes the last thing that can surprise a library
+      caller.
+- [ ] `a tree-building API, or a documented decision not to have one`
+      why: the serialiser currently exists only to prove the parser
+      round-trips.  Half an API (read but not write) is a thing someone will
+      file a bug about, and "no" in the README is a cheaper answer than
+      json_set.
+- [ ] `coverage-guided fuzzing`
+      why: /dev/urandom plus the truncation sweep is the cheap version.  gcc
+      has -fsanitize=fuzzer-no-link only via clang's libFuzzer, and afl is not
+      installed, so this needs a decision about what is allowed on the machine
+      before it needs code.
+- [ ] `score the suite's other corpora`
+      why: only test_parsing/ is vendored.  test_transform/ asks what a parser
+      does with documents whose *meaning* is ambiguous (duplicate keys, huge
+      numbers), which is exactly where our policies are stated but unverified
+      against anyone else's expectations.
