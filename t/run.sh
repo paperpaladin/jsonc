@@ -508,6 +508,13 @@ st=$?
 if [ "$st" -eq 0 ]; then ok "truncation sweep over 400kB of /dev/urandom"
 else nok "truncation sweep over 400kB of /dev/urandom (exit $st)"; fi
 
+# --- the differential oracle: CPython's json module ------------------------
+# A second implementation, by other people, over the same corpus plus 120
+# generated documents and a named edge battery.  Its ok/not-ok lines are tee'd
+# into the tally like everything else.
+printf '\n--- differential oracle vs CPython json (t/diff.py)\n'
+python3 t/diff.py ./jsonc "$CORPUS" 2>&1 | tee -a "$OUT"
+
 pass=$(grep -c '^ok - ' "$OUT")
 fail=$(grep -c '^not ok - ' "$OUT")
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
