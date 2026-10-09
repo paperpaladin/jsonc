@@ -174,6 +174,209 @@ static int lit(P *x, const char *s, size_t n)
 	return 0;
 }
 
+
+/* A growable byte buffer for decoded strings.  Always NUL-terminated for the
+ * convenience of callers that know the string has no embedded NUL; `len` is
+ * the authority, because "" is a legal JSON string and decodes to one
+ * NUL byte. */
+typedef struct { char *p; size_t len, cap; } buf;
+
+static int buf_room(P *x, buf *b, size_t n)
+{
+	size_t want = b->len + n + 1;	/* +1 for the terminator */
+	char *q;
+	if (want <= b->cap)
+		return 0;
+	while (b->cap < want)
+		b->cap = b->cap ? b->cap * 2 : 16;
+	if (!(q = realloc(b->p, b->cap)))
+		return fail(x, JSON_ERR_NOMEM, x->p);
+	b->p = q;
+	return 0;
+}
+
+static int buf_put(P *x, buf *b, const void *s, size_t n)
+{
+	if (buf_room(x, b, n) < 0)
+		return -1;
+	memcpy(b->p + b->len, s, n);
+	b->len += n;
+	b->p[b->len] = 0;
+	return 0;
+}
+
+static int buf_byte(P *x, buf *b, unsigned char c)
+{
+	return buf_put(x, b, &c, 1);
+}
+
+/* Copy one UTF-8 sequence starting at x->p.  This is the whole of RFC 3629
+ * written out: the second byte's legal range depends on the lead byte, which
+ * is what rules out overlong encodings (0xC0/0xC1, 0xE0 0x80), the UTF-16
+ * surrogate range encoded directly (0xED 0xA0), and anything above U+10FFFF
+ * (0xF4 0x90, 0xF5-0xFF).  A range check on the lead byte alone accepts all
+ * three, which is the classic hole. */
+static int copy_utf8(P *x, buf *b)
+{
+	const unsigned char *p = x->p;
+	unsigned char c = p[0];
+	size_t n, i;
+	unsigned lo = 0x80, hi = 0xbf;
+
+	if (c >= 0xc2 && c <= 0xdf)		n = 2;
+	else if (c == 0xe0)			{ n = 3; lo = 0xa0; }
+	else if (c == 0xed)			{ n = 3; hi = 0x9f; }
+	else if (c >= 0xe1 && c <= 0xef)	n = 3;
+	else if (c == 0xf0)			{ n = 4; lo = 0x90; }
+	else if (c >= 0xf1 && c <= 0xf3)	n = 4;
+	else if (c == 0xf4)			{ n = 4; hi = 0x8f; }
+	else					return fail(x, JSON_ERR_UTF8, p);
+
+	if ((size_t)(x->end - p) < n)
+		return fail(x, JSON_ERR_UTF8, x->end);
+	for (i = 1; i < n; i++) {
+		unsigned char t = p[i];
+		if (t < (i == 1 ? lo : 0x80) || t > (i == 1 ? hi : 0xbf))
+			return fail(x, JSON_ERR_UTF8, p + i);
+	}
+	if (buf_put(x, b, p, n) < 0)
+		return -1;
+	x->p = p + n;
+	return 0;
+}
+
+static int encode_utf8(P *x, buf *b, unsigned cp)
+{
+	unsigned char o[4];
+	if (cp < 0x80)
+		return buf_byte(x, b, (unsigned char)cp);
+	if (cp < 0x800) {
+		o[0] = (unsigned char)(0xc0 | (cp >> 6));
+		o[1] = (unsigned char)(0x80 | (cp & 0x3f));
+		return buf_put(x, b, o, 2);
+	}
+	if (cp < 0x10000) {
+		o[0] = (unsigned char)(0xe0 | (cp >> 12));
+		o[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f));
+		o[2] = (unsigned char)(0x80 | (cp & 0x3f));
+		return buf_put(x, b, o, 3);
+	}
+	o[0] = (unsigned char)(0xf0 | (cp >> 18));
+	o[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3f));
+	o[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3f));
+	o[3] = (unsigned char)(0x80 | (cp & 0x3f));
+	return buf_put(x, b, o, 4);
+}
+
+/* Four hex digits at x->p, advancing past them.  strtoul is not usable here:
+ * it skips leading whitespace, accepts a sign, and would read past the end of
+ * a buffer that is not NUL-terminated. */
+static int hex4(P *x, unsigned *out)
+{
+	unsigned v = 0;
+	int i;
+	if ((size_t)(x->end - x->p) < 4)
+		return fail(x, JSON_ERR_EOF, x->end);
+	for (i = 0; i < 4; i++) {
+		unsigned char c = x->p[i];
+		v <<= 4;
+		if (c >= '0' && c <= '9')	v |= (unsigned)(c - '0');
+		else if (c >= 'a' && c <= 'f')	v |= (unsigned)(c - 'a' + 10);
+		else if (c >= 'A' && c <= 'F')	v |= (unsigned)(c - 'A' + 10);
+		else				return fail(x, JSON_ERR_STRING, x->p + i);
+	}
+	x->p += 4;
+	*out = v;
+	return 0;
+}
+
+/* On failure the buffer is freed and zeroed, so a caller that only checks the
+ * return value cannot leak. */
+static int parse_string(P *x, buf *b)
+{
+	b->p = NULL;
+	b->len = b->cap = 0;
+
+	if (x->p >= x->end || *x->p != '"') {
+		fail(x, x->p >= x->end ? JSON_ERR_EOF : JSON_ERR_TOKEN,
+		     x->p >= x->end ? x->end : x->p);
+		return -1;
+	}
+	x->p++;
+	for (;;) {
+		unsigned char c;
+		if (x->p >= x->end) {
+			fail(x, JSON_ERR_EOF, x->end);
+			goto bad;
+		}
+		c = *x->p;
+		if (c == '"') {
+			x->p++;
+			break;
+		}
+		if (c == '\\') {
+			const unsigned char *esc = x->p;
+			unsigned cp;
+			if (x->end - x->p < 2) {
+				fail(x, JSON_ERR_EOF, x->end);
+				goto bad;
+			}
+			x->p += 2;
+			switch (esc[1]) {
+			case '"':  if (buf_byte(x, b, '"')  < 0) goto bad; break;
+			case '\\': if (buf_byte(x, b, '\\') < 0) goto bad; break;
+			case '/':  if (buf_byte(x, b, '/')  < 0) goto bad; break;
+			case 'b':  if (buf_byte(x, b, '\b') < 0) goto bad; break;
+			case 'f':  if (buf_byte(x, b, '\f') < 0) goto bad; break;
+			case 'n':  if (buf_byte(x, b, '\n') < 0) goto bad; break;
+			case 'r':  if (buf_byte(x, b, '\r') < 0) goto bad; break;
+			case 't':  if (buf_byte(x, b, '\t') < 0) goto bad; break;
+			case 'u':
+				if (hex4(x, &cp) < 0)
+					goto bad;
+				/* shortcut: every surrogate is rejected here.  The
+				 * pairing rule is the next commit; until then a
+				 * legal astral-plane escape is an error, which is wrong
+				 * but not unsafe. */
+				if (cp >= 0xd800 && cp <= 0xdfff) {
+					fail(x, JSON_ERR_SURROGATE, esc);
+					goto bad;
+				}
+				if (encode_utf8(x, b, cp) < 0)
+					goto bad;
+				break;
+			default:
+				fail(x, JSON_ERR_STRING, esc + 1);
+				goto bad;
+			}
+			continue;
+		}
+		/* RFC 8259 section 7: unescaped = %x20-21 / %x23-5B / %x5D-10FFFF.
+		 * Everything below 0x20 must be escaped; DEL need not be. */
+		if (c < 0x20) {
+			fail(x, JSON_ERR_STRING, x->p);
+			goto bad;
+		}
+		if (c < 0x80) {
+			if (buf_byte(x, b, c) < 0)
+				goto bad;
+			x->p++;
+			continue;
+		}
+		if (copy_utf8(x, b) < 0)
+			goto bad;
+	}
+	if (buf_room(x, b, 0) < 0)	/* guarantees p != NULL for "" */
+		goto bad;
+	b->p[b->len] = 0;
+	return 0;
+bad:
+	free(b->p);
+	b->p = NULL;
+	b->len = b->cap = 0;
+	return -1;
+}
+
 static json *parse_value(P *x);
 
 static json *parse_value(P *x)
@@ -184,6 +387,18 @@ static json *parse_value(P *x)
 		return NULL;
 	}
 	switch (*x->p) {
+	case '"': {
+		buf b;
+		if (parse_string(x, &b) < 0)
+			return NULL;
+		if (!(j = node(x, JSON_STRING))) {
+			free(b.p);
+			return NULL;
+		}
+		j->u.string.p = b.p;
+		j->u.string.len = b.len;
+		return j;
+	}
 	case 'n':
 		if (lit(x, "null", 4) < 0)
 			return NULL;
