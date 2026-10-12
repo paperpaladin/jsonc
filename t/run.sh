@@ -40,13 +40,32 @@ fi
 # These duplicate a few JSONTestSuite cases on purpose: when the corpus is
 # missing this section still fails if the parser breaks.
 printf '\n--- hand-written accept/reject cases\n'
+# Both helpers compare the exit status to an exact value rather than using
+# `if cmd`, because `if cmd` is true only on 0 and so treats EVERY nonzero
+# status as the other outcome -- including 139 for a segfault and 134 for an
+# abort. Written the obvious way, `rej` scored a crash as a successful
+# rejection, across the 150-odd reject cases in the table below.
+#
+# That is exactly what this README says the suite does not do: "a segfault
+# satisfies 'did not exit 0', so a harness written as `! ./jsonc "$f"`
+# scores a crash as a pass. Ours does not." It was true of the corpus loop,
+# which checks `st -ne 0 && st -ne 1`, and false here -- in the section
+# whose stated job is to still catch a broken parser when the corpus is
+# absent, and the only one covering the malformed-UTF-8 and surrogate
+# inputs.
 acc() { # acc <printf-format> <label>
-	if printf '%b' "$1" | ./jsonc 2>/dev/null; then ok "accept $2"
-	else nok "accept $2"; fi
+	printf '%b' "$1" | ./jsonc >/dev/null 2>&1
+	_st=$?
+	if [ "$_st" -eq 0 ]; then ok "accept $2"
+	elif [ "$_st" -eq 1 ]; then nok "accept $2"
+	else nok "accept $2 (EXIT $_st -- crash, abort or sanitizer)"; fi
 }
 rej() {
-	if printf '%b' "$1" | ./jsonc 2>/dev/null; then nok "reject $2"
-	else ok "reject $2"; fi
+	printf '%b' "$1" | ./jsonc >/dev/null 2>&1
+	_st=$?
+	if [ "$_st" -eq 1 ]; then ok "reject $2"
+	elif [ "$_st" -eq 0 ]; then nok "reject $2"
+	else nok "reject $2 (EXIT $_st -- crash, abort or sanitizer)"; fi
 }
 
 acc 'null'            'null'

@@ -36,6 +36,19 @@ what the filename asks for**.  That matters more than the score: a segfault on
 `n_structure_100000_opening_arrays.json` satisfies "did not exit 0", so a
 harness written as `! ./jsonc "$f"` scores a crash as a pass.  Ours does not.
 
+That was true of the corpus loop and **false of the hand-written table** until
+it was fixed.  `rej()` was written `if ... ; then nok; else ok; fi`, and `if
+cmd` is true only on exit 0 -- so every nonzero status counted as a successful
+rejection, 134 for an abort and 139 for a segfault included, across roughly
+150 reject cases.  It was wrong in the one section whose stated job is to
+still catch a broken parser when the corpus is absent, and the only one
+covering the malformed-UTF-8 and surrogate inputs.
+
+Demonstrated by making `jsonc` call `abort()` where it returns 1.  On five
+reject cases the old helper reported `ok` five times; the new one reports
+`EXIT 134` five times.  Both helpers now compare the status to an exact
+value and name the number when it is neither.
+
 `i_*` files are implementation-defined -- either answer conforms -- but the
 answer has to be consistent, so all 35 are recorded in `t/i_choices.expected`
 and diffed on every run.  Changing one now fails the suite.  The choices:
