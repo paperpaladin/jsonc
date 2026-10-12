@@ -486,6 +486,23 @@ else
 	say "SCORE y_ accepted: $yp/$((yp + yf))"
 	say "SCORE n_ rejected: $np/$((np + nf))"
 	say "SCORE i_ choices:  $((ia + ir)) made ($ia accepted, $ir rejected)"
+	# The denominators are pinned, not just the numerators. "all y_ files
+	# accepted" is true of 95 files and equally true of none: the check
+	# above is `[ "$yf" -eq 0 ]`, and an empty or half-extracted corpus
+	# gives yf=0 along with a quietly smaller yp. The [ -d "$CORPUS" ]
+	# guard only proves the directory exists, which is the same gap wasmi
+	# had with t/fix. t/i_choices.expected catches it by accident, since
+	# its 35 lines would not diff against none; these three make it
+	# deliberate. The numbers come from JSONTestSuite's test_parsing and
+	# move only when the vendored tarball does.
+	for want in "y_ 95 $((yp + yf))" "n_ 188 $((np + nf))" "i_ 35 $((ia + ir))"; do
+		set -- $want
+		if [ "$3" -eq "$2" ]; then
+			ok "corpus holds the expected $2 $1 files"
+		else
+			nok "corpus holds $3 $1 files, expected $2 -- corpus is incomplete"
+		fi
+	done
 	if [ "$crash" -eq 0 ]; then ok "no corpus file produced an exit status outside {0,1}"
 	else nok "$crash corpus files crashed (see scratch/conformance_failures.txt)"; fi
 	if [ "$yf" -eq 0 ]; then ok "all y_ files accepted ($yp)"

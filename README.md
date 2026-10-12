@@ -128,7 +128,7 @@ A clean sanitizer run against a buffer with slack is not evidence of anything.
 
 ```sh
 make            # gcc -std=c11 -Wall -Wextra -Wpedantic -O2
-make test       # 363 passed, 0 failed
+make test       # 366 passed, 0 failed
 make test-asan  # same, under -fsanitize=address,undefined
 make test-valgrind
 ```
