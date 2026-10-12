@@ -495,14 +495,19 @@ else
 	# its 35 lines would not diff against none; these three make it
 	# deliberate. The numbers come from JSONTestSuite's test_parsing and
 	# move only when the vendored tarball does.
-	for want in "y_ 95 $((yp + yf))" "n_ 188 $((np + nf))" "i_ 35 $((ia + ir))"; do
-		set -- $want
+	# A function rather than `set -- $want` in a loop: set -- would rewrite
+	# the script's own positional parameters, which is harmless here only
+	# because nothing below reads them.
+	pin_corpus() {  # pin_corpus LABEL WANT GOT
 		if [ "$3" -eq "$2" ]; then
 			ok "corpus holds the expected $2 $1 files"
 		else
 			nok "corpus holds $3 $1 files, expected $2 -- corpus is incomplete"
 		fi
-	done
+	}
+	pin_corpus y_  95 "$((yp + yf))"
+	pin_corpus n_ 188 "$((np + nf))"
+	pin_corpus i_  35 "$((ia + ir))"
 	if [ "$crash" -eq 0 ]; then ok "no corpus file produced an exit status outside {0,1}"
 	else nok "$crash corpus files crashed (see scratch/conformance_failures.txt)"; fi
 	if [ "$yf" -eq 0 ]; then ok "all y_ files accepted ($yp)"
