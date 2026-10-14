@@ -27,8 +27,7 @@ crash, read out of bounds, leak, or recurse without bound.**
 
 Both halves are externally checked.  The first half is scored against
 JSONTestSuite, which we did not write: every `y_*` file accepted, every `n_*`
-file rejected, and a stated, consistent answer for every `i_*` file.  The
-second half is checked by parsing every truncation of every corpus file under
+file rejected, and a stated, consistent answer for every `i_*` file.  Its second half is checked by parsing every truncation of every corpus file under
 `-fsanitize=address,undefined`: 70k-odd parses of deliberately malformed
 input, and by a depth limit that turns a 100000-deep document into an error
 return instead of a stack overflow.
