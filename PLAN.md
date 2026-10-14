@@ -161,5 +161,5 @@ Next, in order:
 - [ ] `score the suite's other corpora`
       why: only test_parsing/ is vendored.  test_transform/ asks what a parser
       does with documents whose *meaning* is ambiguous (duplicate keys, huge
-      numbers), which is exactly where our policies are stated but unverified
+      numbers), exactly where our policies are stated but unverified
       against anyone else's expectations.
