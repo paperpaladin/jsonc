@@ -9,7 +9,7 @@ Comments are rejected.  So are trailing commas, unquoted keys, single-quoted
 strings, `NaN`, `Infinity`, hex numbers, leading `+`, leading zeros, bare
 control characters in strings, lone surrogates and ill-formed UTF-8.
 
-## The score, which is the only interesting claim
+## The score, and the only interesting claim
 
 Anyone can write a JSON parser and assert that it is conformant.  The claim is
 unverifiable without a number from a corpus the author did not write, so here
@@ -70,7 +70,7 @@ DIFF accept/reject agreement with CPython json: 295/318 files
 
 23 disagreements, all pinned in `t/py_divergences.expected`, and **all 23 in
 the same direction: CPython accepts something we reject.**  There is no file we
-accept and CPython rejects, which is the direction that would be alarming.
+accept and CPython rejects, the direction that would be alarming.
 What CPython is lenient about:
 
 - `NaN`, `Infinity` and `-Infinity` as bare tokens.  These are not JSON, and
@@ -114,7 +114,7 @@ sweeps with `--errors-for-leak-kinds=all`.  Both clean.
 **The sweep was useless when it was first written, and that is the most useful
 thing in this repo.**  `slurp()` allocated 64KB up front, so for a five-byte
 document every read past the end of the *document* landed in slack inside the
-same allocation, which is not an error AddressSanitizer can see.  Deleting the
+same allocation, and no error AddressSanitizer can see.  Deleting the
 four-byte length check in `hex4()`: a guaranteed out-of-bounds read on
 `"\u00`, produced a clean sanitizer run and exit 0.  Two one-line fixes:
 `slurp()` now reallocs down to the exact byte count, and `sweep()` copies each
@@ -153,7 +153,7 @@ Line and column for humans, byte offset in brackets because it is the only
 coordinate the API returns.
 
 As a library there is no header: `#define JSONC_NO_MAIN` and `#include
-"jsonc.c"`, which is what `t/unit.c` does.
+"jsonc.c"`, as `t/unit.c` does.
 
 ```c
 json *root;
@@ -200,8 +200,8 @@ back as the same double.  `%.17g` alone prints `0.1` as
 `0.10000000000000001`; taking the *first* precision that round-trips rather
 than the shortest *result* prints `100` as `1e+02`, because `%g` picks
 exponential notation when the decimal exponent is at least the precision.
-`t/diff.py` implements the identical rule in Python, which is what lets the
-two compare serialised text instead of parsed values.
+`t/diff.py` implements the identical rule in Python, and that lets the two
+compare serialised text instead of parsed values.
 
 `JSONC_MAX_DEPTH` is 1000, compile-time only.  Deeper is
 `JSON_ERR_DEPTH`, not a crash: rebuilt with `-DJSONC_MAX_DEPTH=100000000` and
