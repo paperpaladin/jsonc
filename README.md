@@ -215,8 +215,7 @@ limit it exits 1.
   way to parse a 4GB file or to feed bytes as they arrive.
 - No way to build or mutate a tree. You can parse and you can serialise
   what you parsed.  There is no `json_new_object`, no `json_set`, no
-  `json_append`.  The serialiser exists to prove the parser round-trips, not
-  to be a writer API.
+  `json_append`.  The serialiser exists to prove the parser round-trips, and never as a writer API.
 - No int64, no bignum, no original-spelling preservation. See above.  This
   rules out signing JWTs, canonical JSON per RFC 8785, and anything that
   compares numbers textually.
@@ -230,8 +229,7 @@ limit it exits 1.
   cost the "libc only, any libc" property.
 - `json_get` is a linear scan, so looking up n keys in an n-key object is
   O(n^2).  Marked `shortcut:` in the source.  The CLI never calls it.
-- The truncation sweep steps for large inputs. Over 8KB it cuts at
-  `len/4096` boundaries, not every byte, which affects 3 of the 318
+- The truncation sweep steps for large inputs. Over 8KB it cuts at `len/4096` boundaries instead of every byte, which affects 3 of the 318
   corpus files.  Marked `shortcut:`.
 - `-p` only does 2-space indent. `json_write` takes any width; the CLI
   does not expose it, because the only consumer that mattered was the
