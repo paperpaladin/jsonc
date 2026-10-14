@@ -94,7 +94,7 @@ The 2 exceptions are `y_number_minus_zero` and `y_number_negative_zero`:
 CPython reads `-0` as the integer `0` and loses the sign.  We read every
 number as a `double` and print `-0`.  RFC 8259 says nothing about signed zero,
 so neither is wrong, but the two cannot be byte-compared.  Those two filenames
-are excused individually and the count is asserted: a blanket "ignore signed
+are excused individually and the count is asserted. A blanket "ignore signed
 zero" rule would have hidden a real sign bug anywhere else.
 
 ## Third oracle: the sanitizers over a truncation sweep
