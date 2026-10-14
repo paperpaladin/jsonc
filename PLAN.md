@@ -29,8 +29,8 @@ Both halves are externally checked.  The first half is scored against
 JSONTestSuite, which we did not write: every `y_*` file accepted, every `n_*`
 file rejected, and a stated, consistent answer for every `i_*` file.  The
 second half is checked by parsing every truncation of every corpus file under
-`-fsanitize=address,undefined` -- 70k-odd parses of deliberately malformed
-input -- and by a depth limit that turns a 100000-deep document into an error
+`-fsanitize=address,undefined`: 70k-odd parses of deliberately malformed
+input, and by a depth limit that turns a 100000-deep document into an error
 return instead of a stack overflow.
 
 A JSON parser that claims conformance without a number from an external corpus
@@ -40,23 +40,23 @@ is making an unverifiable claim.  The number is the deliverable.
 
 Ranked by how little we control them.
 
-1. **JSONTestSuite** (github.com/nst/JSONTestSuite, MIT, Nicolas Seriot).  318
+1. JSONTestSuite (github.com/nst/JSONTestSuite, MIT, Nicolas Seriot).  318
    files in `test_parsing/`: 95 `y_` must-accept, 188 `n_` must-reject, 35 `i_`
    implementation-defined.  Not ours, not derived from our reading of the spec,
    and specifically built out of the inputs that broke real parsers.  Vendored
    as a 12KB tarball under `t/` so `make test` needs no network, with its
    licence beside it.
-2. **CPython's `json` module.**  A differential oracle in two directions:
+2. CPython's `json` module.  A differential oracle in two directions:
    accept/reject agreement over the whole corpus plus generated documents, and
-   value agreement -- parse with both, canonicalise both, compare the text.
+   value agreement, parse with both, canonicalise both, compare the text.
    Independent implementation, independent authors, and it disagrees with us in
    places we then have to justify (it accepts `NaN`, `Infinity` and lone
-   surrogates; we do not).
-3. **The sanitizers.**  `-fsanitize=address,undefined` over the truncation
+   surrogates. We do not).
+3. The sanitizers.  `-fsanitize=address,undefined` over the truncation
    sweep.  Not a correctness oracle, but the only authority on memory safety
    that is not our own opinion, and the truncation sweep is the input shape
    designed to provoke it.
-4. **Round-trip.**  parse -> serialise -> parse must give the same tree, and
+4. Round-trip.  parse -> serialise -> parse must give the same tree, and
    the second serialisation must be byte-identical to the first.  Self-
    consistency only, so it is ranked last, but it is the only check that
    exercises the serialiser against the parser.
@@ -65,7 +65,7 @@ Ranked by how little we control them.
 
 - Comments, trailing commas, unquoted keys, single-quoted strings, `NaN`,
   `Infinity`, hex numbers, leading `+`, leading zeros.  All rejected.  "Strict"
-  is the entire point; a lenient mode would halve the value of the score.
+  is the entire point. A lenient mode would halve the value of the score.
 - Preserving integer precision.  RFC 8259 section 6 permits the double-only
   interpretation and says so; `json_number` is a `double` and
   `123456789012345678901` loses bits.  Stated in the README, not fixed.
@@ -93,7 +93,7 @@ Ranked by how little we control them.
       why: first recursive production.
 - [x] `objects, duplicate keys kept in document order`
       why: second recursive production, and the duplicate-key policy had to be
-      decided here rather than discovered later.
+      decided here, not discovered later.
 - [x] `the depth limit: a 1000000-deep document is an error, not a SIGSEGV`
       why: the corpus ships a 100000-deep document to crash recursive-descent
       parsers, and a crash is not a rejection.
@@ -104,7 +104,7 @@ Ranked by how little we control them.
       compare as text.
 - [x] `the pretty printer and the CLI flags`
       why: -p output is byte-comparable with json.dumps(indent=2), so the
-      pretty printer is oracle-checked rather than eyeballed.  Found the
+      pretty printer is oracle-checked, not eyeballed.  Found the
       signed-zero divergence immediately.
 - [x] `the conformance runner over vendored JSONTestSuite: 95/95, 188/188`
       why: this is the project.  Everything before it was unverified.
@@ -138,12 +138,12 @@ Next, in order:
       why: one calloc per node means a 100k-element array is 100k small
       allocations and json_free is 100k frees.  An arena makes the free path a
       single call, which also deletes every partial-free path in the error
-      handling -- the place where a leak would hide.  Measure first: nothing
+      handling: the place where a leak would hide.  Measure first: nothing
       here is currently performance-bound, so this is only worth doing if
       `-S` on the corpus is dominated by malloc, which has not been checked.
 - [ ] `locale independence, or an explicit refusal`
-      why: the one limitation in the README that is asserted from the spec
-      rather than demonstrated, because no comma-decimal locale is installed.
+      why: the one limitation in the README that is asserted from the
+      spec, not demonstrated, because no comma-decimal locale is installed.
       Either install one and add the test, or parse and print the decimal
       digits directly and stop calling strtod and snprintf at all.  The second
       is more code and removes the last thing that can surprise a library
