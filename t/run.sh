@@ -578,6 +578,129 @@ st=$?
 if [ "$st" -eq 0 ]; then ok "truncation sweep over 400kB of /dev/urandom"
 else nok "truncation sweep over 400kB of /dev/urandom (exit $st)"; fi
 
+# --- the arena, and the allocation mode that keeps ASan useful -------------
+# json_parse() bump-allocates the whole tree out of one arena.  That is faster
+# and it deletes every partial-free path in the parser, and it also blinds ASan
+# to a write that runs off the end of one node into the next, because the two
+# nodes share one malloc'd block.  -DJSONC_ARENA_DEBUG gives every object its
+# own exactly sized malloc() instead, which puts a redzone back between
+# neighbours and makes every growth move the object.
+#
+# Two claims to check.  The modes must agree on every byte, not merely on
+# accept/reject: the whole point of an allocator change is that nothing
+# observable moves.  And the sweep has to run in the mode where the sanitizer
+# can see between objects, or `make test-asan` is reporting clean over the
+# arena's blind spot.
+printf '\n--- the arena: -DJSONC_ARENA_DEBUG against the default allocator\n'
+DBG=$SCRATCH/jsonc-dbg
+# shellcheck disable=SC2086
+if $CC $CFLAGS -DJSONC_ARENA_DEBUG -o "$DBG" jsonc.c -lm; then
+	ok "compile jsonc with -DJSONC_ARENA_DEBUG"
+else
+	nok "compile jsonc with -DJSONC_ARENA_DEBUG"
+fi
+# shellcheck disable=SC2086
+if $CC $CFLAGS -DJSONC_ARENA_DEBUG -o "$SCRATCH/unit-dbg" t/unit.c -lm; then
+	if "$SCRATCH/unit-dbg" > "$SCRATCH/unit-dbg.out" 2>&1; then
+		# The count is in the line because "t/unit passes" is equally
+		# true of a binary that asserts nothing.
+		ok "t/unit under -DJSONC_ARENA_DEBUG: $(grep -c '^ok - ' "$SCRATCH/unit-dbg.out") assertions, 0 failed"
+	else
+		nok "t/unit under -DJSONC_ARENA_DEBUG"
+		grep -v '^ok - ' "$SCRATCH/unit-dbg.out"
+	fi
+else
+	nok "compile t/unit with -DJSONC_ARENA_DEBUG"
+fi
+if [ -d "$CORPUS" ] && [ -x "$DBG" ]; then
+	diffs=0
+	seen=0
+	for f in "$CORPUS"/*.json; do
+		seen=$((seen + 1))
+		a=$(./jsonc -c "$f" 2>&1); sa=$?
+		b=$("$DBG" -c "$f" 2>&1); sb=$?
+		if [ "$sa" -ne "$sb" ] || [ "$a" != "$b" ]; then
+			diffs=$((diffs + 1))
+			printf 'ARENA MODE DIFFERS: %s (exit %s vs %s)\n' \
+				"${f##*/}" "$sa" "$sb"
+		fi
+	done
+	if [ "$diffs" -eq 0 ]; then
+		ok "$seen corpus files: same verdict and same -c output in both allocation modes"
+	else
+		nok "$diffs of $seen corpus files differ between the two allocation modes"
+	fi
+	bad=0
+	for f in "$CORPUS"/*.json; do
+		"$DBG" -S "$f" >/dev/null 2>&1 || bad=$((bad + 1))
+	done
+	if [ "$bad" -eq 0 ]; then
+		ok "truncation sweep over $seen corpus files with one malloc per object"
+	else
+		nok "$bad corpus files failed the sweep under -DJSONC_ARENA_DEBUG"
+	fi
+	"$DBG" -S "$SCRATCH/random.bin" > /dev/null 2>&1
+	st=$?
+	if [ "$st" -eq 0 ]; then ok "truncation sweep over 400kB of /dev/urandom, one malloc per object"
+	else nok "truncation sweep over random bytes under -DJSONC_ARENA_DEBUG (exit $st)"; fi
+fi
+
+# --- the redzone the debug allocator exists to restore ---------------------
+# -DJSONC_ARENA_DEBUG is only worth having if its redzones fire, and a redzone
+# nobody has watched fire is not a redzone.  This plants a read one byte past
+# a decoded string and a read one byte past a node, and requires ASan to
+# report each of them.  It is compiled with -fsanitize=address whatever CFLAGS
+# says, so it runs under plain `make test` as well.
+#
+# Under the ordinary arena both reads are silent, which is the cost written
+# down in the README: the byte after one object is the next object, inside the
+# same block.  The string one was silent before the arena existed too, because
+# buf rounded a 6-byte string up to a 16-byte malloc and the slack swallowed
+# the over-read -- the "buffer larger than its data" bug this collection has
+# found twice elsewhere, present here and unnoticed.  arena_trim() under the
+# debug allocator reallocs down to the exact length, which is what makes the
+# first of these two cases report at all.
+printf '\n--- the debug allocator restores the redzones ASan lost to the arena\n'
+cat > "$SCRATCH/overread.c" <<'PROBE'
+#define JSONC_NO_MAIN
+#include "../jsonc.c"
+int main(int argc, char **argv)
+{
+	json *j = NULL;
+	const json *s;
+	size_t off;
+	volatile unsigned char c;
+	if (json_parse("[\"abcde\",1]", 11, &j, &off) != JSON_OK)
+		return 2;
+	s = json_at(j, 0);
+	if (argc > 1 && argv[1][0] == 'n')
+		c = ((const unsigned char *)s)[sizeof(json)];
+	else
+		c = (unsigned char)s->u.string.p[s->u.string.len + 1];
+	printf("%d\n", (int)c);
+	json_free(j);
+	return 0;
+}
+PROBE
+if $CC -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+	-DJSONC_ARENA_DEBUG -o "$SCRATCH/overread" "$SCRATCH/overread.c" -lm \
+	2> "$SCRATCH/overread.log"; then
+	for what in string node; do
+		if "$SCRATCH/overread" "$what" > /dev/null 2> "$SCRATCH/overread.err"
+		then
+			nok "a read one byte past a $what is NOT reported under -DJSONC_ARENA_DEBUG"
+		elif grep -q 'heap-buffer-overflow' "$SCRATCH/overread.err"; then
+			ok "ASan reports a read one byte past a $what under -DJSONC_ARENA_DEBUG"
+		else
+			nok "the $what over-read failed without a heap-buffer-overflow report"
+			head -3 "$SCRATCH/overread.err"
+		fi
+	done
+else
+	nok "compile the over-read probe"
+	cat "$SCRATCH/overread.log"
+fi
+
 # --- the differential oracle: CPython's json module ------------------------
 # A second implementation, by other people, over the same corpus plus 120
 # generated documents and a named edge battery.  Its ok/not-ok lines are tee'd

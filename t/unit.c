@@ -14,6 +14,7 @@
 #include "../jsonc.c"
 
 #include <math.h>
+#include <stdint.h>
 
 static int fails;
 
@@ -252,11 +253,134 @@ static void test_write(void)
 	}
 }
 
+/* --- the arena ----------------------------------------------------------- */
+
+/* Three things the corpus cannot check, because every file in it is small and
+ * fits in one arena block with room to spare:
+ *
+ *   alignment, which is the classic arena bug and is invisible on x86-64 for
+ *   every type this file allocates.  A decoded string is byte-aligned and of
+ *   arbitrary length, so an odd-length string immediately in front of a node
+ *   is what turns a missing round-up into a misaligned double.  These
+ *   assertions fail on their own; -fsanitize=undefined reports the same defect
+ *   as a misaligned store, and t/run.sh runs under it.
+ *
+ *   block growth, which needs a document bigger than JSONC_ARENA_BLOCK before
+ *   a second block is ever allocated.
+ *
+ *   pointers staying valid.  An arena that reuses or moves memory it has
+ *   already handed out is only caught by reading the FIRST element after the
+ *   last one has been allocated.
+ */
+static void test_arena(void)
+{
+	static const char *mixed =
+	    "[\"a\",1.5,\"abc\",2.5,\"abcde\",3.5,\"\",4.5,\"abcdefg\",5.5,"
+	    "{\"q\":\"xyz\"},6.5]";
+	json *j = NULL;
+	size_t off, i, n = 20000, used;
+	int bad;
+	char *doc, msg[120];
+
+	/* 1. alignment across types of different alignment */
+	chk(json_parse(mixed, strlen(mixed), &j, &off) == JSON_OK,
+	    "arena: the mixed-alignment document parses");
+	chk(json_len(j) == 12, "arena: twelve elements");
+	bad = 0;
+	for (i = 0; i < json_len(j); i++)
+		if ((uintptr_t)json_at(j, i) % _Alignof(json))
+			bad++;
+	chk(bad == 0, "arena: every node is aligned for _Alignof(json)");
+	chk(((uintptr_t)j % _Alignof(json)) == 0, "arena: the root node is aligned");
+	chk(((uintptr_t)j->u.array.v % _Alignof(json *)) == 0,
+	    "arena: the array's element vector is aligned");
+	{
+		const json *o = json_at(j, 10);
+		chk(o && o->type == JSON_OBJECT &&
+		    ((uintptr_t)o->u.object.v % _Alignof(json_member)) == 0,
+		    "arena: the object's member vector is aligned");
+	}
+	/* The values have to be right as well: an arena that hands out
+	 * overlapping allocations keeps the alignment and loses the data. */
+	bad = 0;
+	for (i = 1; i < 12; i += 2) {
+		const json *e = json_at(j, i);
+		if (!e || e->type != JSON_NUMBER || e->u.number != 1.5 + (double)(i / 2))
+			bad++;
+	}
+	chk(bad == 0, "arena: the numbers between the odd-length strings survive");
+	chk(json_at(j, 4) && json_at(j, 4)->u.string.len == 5 &&
+	    memcmp(json_at(j, 4)->u.string.p, "abcde", 6) == 0,
+	    "arena: a string between two numbers survives, terminator included");
+	json_free(j);
+
+	/* 2. and 3. a document far larger than one arena block */
+	if (!(doc = malloc(80 * n))) {
+		nok("arena: malloc for the large document");
+		return;
+	}
+	used = 0;
+	doc[used++] = '[';
+	for (i = 0; i < n; i++) {
+		size_t sl = i % 37 + 1, k;
+		used += (size_t)sprintf(doc + used, "%s{\"i\":%zu,\"s\":\"",
+					i ? "," : "", i);
+		for (k = 0; k < sl; k++)
+			doc[used++] = 'x';
+		doc[used++] = '"';
+		doc[used++] = '}';
+	}
+	doc[used++] = ']';
+	chk(json_parse(doc, used, &j, &off) == JSON_OK,
+	    "arena: a document spanning many arena blocks parses");
+	chk(json_len(j) == n, "arena: every element of it is present");
+	bad = 0;
+	for (i = 0; i < json_len(j); i++) {
+		const json *e = json_at(j, i), *v;
+		if (!e || !(v = json_get(e, "i")) || v->u.number != (double)i) {
+			bad++;
+			continue;
+		}
+		v = json_get(e, "s");
+		if (!v || v->u.string.len != i % 37 + 1 ||
+		    v->u.string.p[i % 37 + 1] != 0 ||
+		    strspn(v->u.string.p, "x") != i % 37 + 1)
+			bad++;
+	}
+	snprintf(msg, sizeof msg,
+		 "arena: all %zu elements still read back correctly after the "
+		 "last one was allocated", n);
+	chk(bad == 0, msg);
+	json_free(j);
+	free(doc);
+
+	/* A single string longer than a block: the decode buffer has to grow
+	 * past the end of the block it started in and keep what it had. */
+	{
+		size_t len = 50000;
+		if (!(doc = malloc(len + 3))) {
+			nok("arena: malloc for the long string");
+			return;
+		}
+		doc[0] = '"';
+		memset(doc + 1, 'y', len);
+		doc[len + 1] = '"';
+		chk(json_parse(doc, len + 2, &j, &off) == JSON_OK,
+		    "arena: a 50000-byte string parses");
+		chk(j && j->type == JSON_STRING && j->u.string.len == len &&
+		    strspn(j->u.string.p, "y") == len && j->u.string.p[len] == 0,
+		    "arena: the 50000-byte string survives crossing blocks");
+		json_free(j);
+		free(doc);
+	}
+}
+
 int main(void)
 {
 	test_errors();
 	test_dom();
 	test_depth();
 	test_write();
+	test_arena();
 	return fails ? 1 : 0;
 }

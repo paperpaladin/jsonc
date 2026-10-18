@@ -131,15 +131,42 @@ Ranked by how little we control them.
       why: a README that only lists successes is not finished.
 - [x] `PLAN: record the final state`
 
-Next, in order:
-
-- [ ] `an arena allocator behind json_parse`
+- [x] `an arena allocator behind json_parse`
       why: one calloc per node means a 100k-element array is 100k small
       allocations and json_free is 100k frees.  An arena makes the free path a
       single call, which also deletes every partial-free path in the error
       handling: the place where a leak would hide.  Measure first: nothing
       here is currently performance-bound, so this is only worth doing if
       `-S` on the corpus is dominated by malloc, which has not been checked.
+      done: it was.  callgrind on a 5.5MB document of 50k records put the
+      libc allocator at 385,329,838 of 699,233,648 instructions, 55%; after,
+      317,703 of 318,024,057, 0.1%.  Total instructions -54.5% there, -37.7%
+      on 200k strings, -19.2% on 200k numbers (that one is 68% strtod, which
+      the arena does not touch).  `-S` over the 318 corpus files, 12605
+      truncated parses, 0.94s -> 0.55s median of seven.  Peak RSS 62.7MB ->
+      41.2MB, since a node no longer carries a malloc chunk header.
+      Twenty-one free/json_free lines and both container `bad:` labels gone.
+      oracle: all 318 corpus files produce byte-identical output and exit
+      status under the pre-arena binary, the arena binary and the debug
+      allocator, across plain, -c, -p and -S; the JSONTestSuite score and the
+      23 pinned CPython divergences are unmoved.
+      cost: ASan can no longer see a write from one arena object into the
+      next.  -DJSONC_ARENA_DEBUG gives every object its own exactly sized
+      malloc; the suite runs the corpus, the sweep and all of t/unit in both
+      modes and requires them to agree.
+      watched failing: overlapping allocations (exit 139), alignment round-up
+      deleted (unit assertion, and UBSan "member access within misaligned
+      address"), never growing a second block (ASan heap-buffer-overflow),
+      arena_grow not copying, arena_trim discarding the string, the debug
+      allocator over-allocating by 32 bytes and arena_trim not shrinking in
+      debug mode (both turn the new redzone cases red).  Leaking every block
+      after the first SURVIVES `make test` and is caught only by
+      `make test-asan`; written down in the README.
+      found: the pre-arena string buffer was already blind to a read one byte
+      past a decoded string, because buf rounded 6 bytes up to a 16-byte
+      malloc and never trimmed.  Same probe, same silence, against HEAD.
+
+Next, in order:
 - [ ] `locale independence, or an explicit refusal`
       why: the one limitation in the README that is asserted from the
       spec, not demonstrated, because no comma-decimal locale is installed.

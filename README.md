@@ -124,13 +124,114 @@ buffer.  With those, the same deliberate breakage reports
 
 A clean sanitizer run against a buffer with slack is not evidence of anything.
 
+## The arena, and what it costs the sanitizer
+
+`json_parse` bump-allocates the entire tree out of one arena: every node,
+every decoded string, every array and object vector.  `json_free` releases it
+by walking a short list of blocks.  Before, it was one `calloc` per node, one
+`malloc` per string, one `realloc` chain per vector, and a recursive
+`json_free` that matched them one for one.
+
+Measured, not asserted.  Instruction counts are from
+`valgrind --tool=callgrind` on three generated documents in `scratch/bench`,
+wall clock is the median of eleven runs of the CLI:
+
+| input | Ir before | Ir after | allocator Ir before | after | wall before | after |
+|---|---|---|---|---|---|---|
+| 50k records, 5.5MB (objects and short strings) | 699,233,648 | 318,024,057 | 385,329,838 (55%) | 317,703 (0.1%) | 0.11s | 0.05s |
+| 200k strings, 9.9MB | 592,451,495 | 369,184,853 | 192,514,818 (32%) | 12,256 (0.0%) | 0.08s | 0.05s |
+| 200k numbers, 3.6MB | 350,623,062 | 283,278,910 | 67,976,964 (19%) | 609,330 (0.2%) | 0.05s | 0.04s |
+
+`jsonc -S` over all 318 corpus files, 12605 truncated parses, goes from 0.94s
+to 0.55s (median of seven).  The number-heavy case moves least because
+`strtod` and the mpn routines under it are 68% of what is left, and the
+arena does not touch them.  Peak RSS falls
+as well, 62.7MB to 41.2MB on the records document, because a node no longer
+carries malloc's per-chunk header.
+
+The plan item that asked for this said to measure before building, because
+"nothing here is currently performance-bound".  The measurement is the 55%
+above: on the object-and-string workload the allocator was the majority of
+the work.
+
+The second reason is that there is no partial-free path left in the parser.
+`parse_object` used to free a key on one error branch and `json_free` a
+half-built value on another; `obj_push` and `arr_push` each had to dispose of
+what they had just been handed when a `realloc` failed.  Twenty-one lines calling
+`free` or `json_free` are gone from `jsonc.c`, along with the two `bad:`
+labels in the container parsers that they served, replaced by `return NULL`.
+
+### What it costs
+
+Two neighbouring nodes now live inside one malloc'd block, so **ASan cannot
+see a write that runs off the end of one node into the next.**  It still sees
+a write that runs off the end of the whole block, and `make test-asan` proves
+that it does: an arena that never allocates a second block reports
+`heap-buffer-overflow`.  Between objects, nothing.
+
+That is the same blindness as a read buffer with slack in it, which this
+collection has found twice before, and it is not undone by noting it here.
+So there is a second allocation mode.  `-DJSONC_ARENA_DEBUG` gives every
+object its own exactly sized `malloc`, which puts a redzone back between
+neighbours; `arena_grow` then always moves the object, so a pointer kept
+across a growth is a stale pointer rather than one that happened to stay
+valid; and `arena_trim` reallocs down to the string's real length rather than
+leaving the doubling slack in place.  `t/run.sh` builds the CLI and `t/unit`
+both ways and runs the corpus, the truncation sweep and the whole unit suite
+in both.  The two modes must agree byte for byte on all 318 corpus files,
+which is checked rather than assumed.
+
+Two cases in the suite exist only to watch those redzones fire: a read one
+byte past a decoded string and a read one byte past a node, each required to
+produce `heap-buffer-overflow` under `-DJSONC_ARENA_DEBUG`.  Removing the
+debug-mode `realloc` from `arena_trim` turns the first red; over-allocating by
+32 bytes in the debug allocator turns the second red.
+
+**The string case was already blind before the arena existed.**  `buf` rounded
+a six-byte string up to a sixteen-byte `malloc` and never trimmed it, so a
+read one past the NUL landed in slack and ASan said nothing, exactly the bug
+the sweep section below describes in `slurp`.  The same probe built against
+the pre-arena commit is silent.  The debug allocator is the first thing in
+this repo that catches it.
+
+### Alignment
+
+A misaligned arena allocation works on x86-64 for every type this file
+allocates and is undefined behaviour regardless, so it is checked in two ways
+that are independent of each other.  `t/unit.c` parses a document that
+interleaves odd-length strings with numbers and objects, and asserts that
+every node, every element vector and every member vector is aligned for its
+type.  That assertion fails on its own, with no sanitizer.  Separately, the
+whole suite runs under `-fsanitize=undefined`, and deleting the round-up in
+`arena_alloc` produces
+`runtime error: member access within misaligned address ... for type 'struct json'`.
+Both were watched failing, which is the only reason to believe either.
+
+### Mutations, including the one that survives
+
+Eight defects were planted in the arena and the gate run against each.  Seven
+turn `make test` or `make test-asan` red: overlapping allocations (the suite
+segfaults), the alignment round-up deleted, a block that never grows,
+`arena_grow` not copying the bytes it was asked to preserve, `arena_trim`
+giving back the string instead of the slack, the debug allocator
+over-allocating by 32 bytes, and `arena_trim` not shrinking under the debug
+allocator.
+
+**One survives `make test`.**  Making `arena_destroy` skip the chain of blocks
+after the first leaks everything a document larger than 4KB allocated, and
+plain `make test` is entirely green.  It is caught by `make test-asan`, where
+LeakSanitizer reports it, and by `make test-valgrind`.  There is no
+uninstrumented check for it, because a leak is not observable from a process
+that is about to exit.  If you change the arena, run `make test-asan`: the
+default target is not sufficient for that class of defect and never was.
+
 ## Build and use
 
 ```sh
 make            # gcc -std=c11 -Wall -Wextra -Wpedantic -O2
-make test       # 366 passed, 0 failed
-make test-asan  # same, under -fsanitize=address,undefined
-make test-valgrind
+make test       # 386 passed, 0 failed
+make test-asan  # same 386, under -fsanitize=address,undefined
+make test-valgrind   # 395: the nine valgrind cases on top
 ```
 
 ```
@@ -236,9 +337,25 @@ limit it exits 1.
   byte-comparison against `json.dumps(indent=2)`.
 - Errors stop at the first one. There is no error recovery and no list of
   all problems in a document.
-- Allocation is one `calloc` per node. A 100k-element array is 100k small
-  allocations.  An arena would be faster and would make `json_free` a single
-  call. It is not written because nothing here is performance-bound.
+- The arena blinds ASan between neighbouring objects. Covered at length
+  above.  `-DJSONC_ARENA_DEBUG` is the answer and the suite runs it, but the
+  binary you ship is the blind one.
+- `json_free` may only be called on a pointer `json_parse` returned. The
+  root node is a member of the arena header and `json_free` finds the arena
+  by stepping back with `offsetof`, so handing it a subtree is undefined.  It
+  was never meaningful before either (it left the parent holding freed
+  children) but it used to be merely wrong rather than undefined.
+- The arena never reuses anything inside one parse. Each doubling of an
+  array or object vector abandons the previous one in the arena, so the peak
+  cost of an n-element vector is about 2n slots.  Total peak RSS still fell,
+  because malloc's per-chunk header on every node cost more than the
+  abandoned vectors do, but a pathological document could invert that.
+- `-DJSONC_ARENA_DEBUG` costs memory. 83.5MB against 41.2MB on the records
+  document, because every object carries a malloc header and a redzone again.
+  It is a test mode, not a build option worth shipping.
+- There is no way to supply your own allocator. `arena_alloc` calls
+  `malloc` directly.  A `json_parse_with` taking an allocator struct is the
+  obvious upgrade and nobody has asked for it.
 - gcc and C11 only. Builds with clang too, but that is not tested in
   `make test`.  `t/unit.c` uses POSIX `open_memstream`, so the *tests* are not
   portable off POSIX even though `jsonc.c` is.

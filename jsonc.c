@@ -15,6 +15,7 @@
  */
 
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,12 +91,222 @@ const char *json_strerror(json_err e)
 	return json_err_msg[(unsigned)e <= JSON_ERR_NOMEM ? (unsigned)e : 0];
 }
 
+/* ----------------------------------------------------------------- arena --- */
+
+/* One parse, one arena.  Every node, every decoded string and every container
+ * vector is bump-allocated out of a short chain of malloc'd blocks, and
+ * json_free() releases the whole tree by walking that chain: a handful of
+ * free() calls where there used to be one per node, one per string and one per
+ * vector.
+ *
+ * Speed was the reason to look, and it is measured in the README rather than
+ * asserted here.  The other half of the win is that the parser no longer has a
+ * partial-free path anywhere in it.  parse_object() used to free a key on one
+ * error branch and json_free() a half-built value on another; obj_push() and
+ * arr_push() each had to dispose of what they had just been handed when a
+ * realloc failed.  That is exactly the shape of code a leak or a double free
+ * hides in.  Those branches are gone: an error return now just returns, and
+ * json_parse() destroys the arena on the way out.
+ *
+ * What it costs is ASan coverage, and the cost is real.  Two neighbouring
+ * nodes live inside one malloc'd block, so a write that runs off the end of
+ * one node into the next is invisible to ASan; it only still sees a write that
+ * runs off the end of the whole block.  This is the same blindness that a
+ * rounded-up read buffer produces, and it is not undone by noting it.
+ *
+ * -DJSONC_ARENA_DEBUG is the undoing.  It gives every object its own exactly
+ * sized malloc(), which puts a redzone back between neighbours, makes
+ * arena_grow() always move the object so that a pointer kept across a growth
+ * is a stale pointer rather than one that happened to stay valid, and makes
+ * arena_trim() realloc down to the exact length so that the slack a doubling
+ * string buffer leaves behind cannot swallow an overrun.  t/run.sh builds the
+ * CLI and t/unit both ways and runs the corpus, the truncation sweep and the
+ * whole unit suite in both, so `make test-asan` covers the arena's blind spot
+ * rather than reporting clean over it.
+ *
+ * json_free() is handed nothing but the root pointer, so the arena has to be
+ * reachable from it: the root node is a member of the arena header and
+ * json_free() steps back to the header with offsetof().  json_free() may
+ * therefore only be called on a pointer json_parse() returned.  Calling it on
+ * a subtree was never meaningful -- it left the parent holding freed children
+ * -- and is now undefined.
+ */
+
+#ifndef JSONC_ARENA_BLOCK
+#define JSONC_ARENA_BLOCK 4096		/* payload of the first block */
+#endif
+#define JSONC_ARENA_BLOCK_MAX (1024 * 1024)
+
+/* _Alignas on the first member raises the header's own alignment to
+ * max_align_t, which also rounds sizeof(ablk) up to a multiple of it, so the
+ * payload at (b + 1) is as aligned as malloc's own result.  That is what lets
+ * arena_alloc() align a request by rounding the offset inside the payload. */
+typedef struct ablk {
+	_Alignas(max_align_t) struct ablk *next;
+	size_t used, cap;		/* of the payload following the header */
+} ablk;
+
+#ifdef JSONC_ARENA_DEBUG
+typedef struct dbgalloc { struct dbgalloc *next; } dbgalloc;
+/* The per-object header is padded to max_align_t for two reasons: the payload
+ * has to be at least as aligned as malloc's result, and it has to END where
+ * the chunk ends, or an overrun lands in padding instead of in ASan's
+ * redzone. */
+#define DBGHDR ((sizeof(dbgalloc) + _Alignof(max_align_t) - 1) \
+		& ~((size_t)_Alignof(max_align_t) - 1))
+#endif
+
+typedef struct arena {
+	ablk *cur;		/* block currently being bumped */
+	ablk *extra;		/* every block after the first, each its own malloc */
+	size_t blksz;		/* payload size for the next block */
+#ifdef JSONC_ARENA_DEBUG
+	dbgalloc *dbg;
+#endif
+	_Alignas(max_align_t) json root;	/* json_free() finds this by offsetof */
+} arena;
+
+/* The header and the first block come out of a single malloc, so a document
+ * that parses to one node still costs one allocation, which is what the
+ * per-node calloc cost before. */
+static arena *arena_new(void)
+{
+	arena *a = malloc(sizeof *a + sizeof(ablk) + JSONC_ARENA_BLOCK);
+	if (!a)
+		return NULL;
+	a->cur = (ablk *)((unsigned char *)a + sizeof *a);
+	a->cur->next = NULL;
+	a->cur->used = 0;
+	a->cur->cap = JSONC_ARENA_BLOCK;
+	a->extra = NULL;
+	a->blksz = JSONC_ARENA_BLOCK;
+#ifdef JSONC_ARENA_DEBUG
+	a->dbg = NULL;
+#endif
+	return a;
+}
+
+static void arena_destroy(arena *a)
+{
+	ablk *b;
+#ifdef JSONC_ARENA_DEBUG
+	dbgalloc *d = a->dbg;
+	while (d) {
+		dbgalloc *n = d->next;
+		free(d);
+		d = n;
+	}
+#endif
+	b = a->extra;
+	while (b) {
+		ablk *n = b->next;
+		free(b);
+		b = n;
+	}
+	free(a);		/* takes the header and the first block with it */
+}
+
+/* `align` is always _Alignof(T) for a T this file allocates, so it never
+ * exceeds _Alignof(max_align_t) and rounding the offset up inside an
+ * already-max-aligned payload is enough.  Dropping the rounding is the classic
+ * arena bug and is invisible on x86-64 for everything except a sanitizer:
+ * t/unit.c asserts the alignment directly and -fsanitize=undefined reports the
+ * misaligned store. */
+static void *arena_alloc(arena *a, size_t n, size_t align)
+{
+#ifdef JSONC_ARENA_DEBUG
+	unsigned char *p = malloc(DBGHDR + n);
+	(void)align;
+	if (!p)
+		return NULL;
+	((dbgalloc *)p)->next = a->dbg;
+	a->dbg = (dbgalloc *)p;
+	return p + DBGHDR;
+#else
+	ablk *b = a->cur;
+	size_t off = (b->used + align - 1) & ~(align - 1);
+
+	if (off + n > b->cap) {
+		size_t want = a->blksz;
+		if (a->blksz < JSONC_ARENA_BLOCK_MAX)
+			a->blksz *= 2;
+		if (want < n)
+			want = n;
+		if (!(b = malloc(sizeof(ablk) + want)))
+			return NULL;
+		b->used = 0;
+		b->cap = want;
+		b->next = a->extra;
+		a->extra = b;
+		a->cur = b;
+		off = 0;
+	}
+	b->used = off + n;
+	return (unsigned char *)(b + 1) + off;
+#endif
+}
+
+/* Grow a reservation from oldn to newn bytes, preserving the first oldn.
+ *
+ * The fast path matters: while a string is being decoded nothing else
+ * allocates, so its buffer is the newest object in the block and doubling it
+ * is one addition.  An array or object vector usually is not the newest (the
+ * element just parsed is), so those fall through to allocate-and-copy, which
+ * is what realloc did anyway.
+ *
+ * `==` between pointers into different objects is defined and false; the
+ * subtraction that follows is only reached once that comparison has proved
+ * they are the same object. */
+static void *arena_grow(arena *a, void *p, size_t oldn, size_t newn, size_t align)
+{
+	void *q;
+#ifndef JSONC_ARENA_DEBUG
+	ablk *b = a->cur;
+	unsigned char *base = (unsigned char *)(b + 1);
+
+	if (p && (unsigned char *)p + oldn == base + b->used &&
+	    (size_t)((unsigned char *)p - base) + newn <= b->cap) {
+		b->used = (size_t)((unsigned char *)p - base) + newn;
+		return p;
+	}
+#endif
+	if ((q = arena_alloc(a, newn, align)) && p)
+		memcpy(q, p, oldn);
+	return q;
+}
+
+/* Hand back the slack at the end of the newest reservation.  A decoded string
+ * is sized by doubling and then trimmed to its real length, so an 8KB string
+ * does not permanently hold 16KB of arena. */
+static char *arena_trim(arena *a, char *p, size_t oldn, size_t newn)
+{
+#ifdef JSONC_ARENA_DEBUG
+	/* Exact-size it: slack at the end of a buffer is the thing that turns
+	 * the sanitizer off, which this collection has found twice. */
+	unsigned char *h = (unsigned char *)p - DBGHDR, *q;
+	(void)oldn;
+	if ((dbgalloc *)h != a->dbg)	/* only the newest can be trimmed */
+		return p;
+	if (!(q = realloc(h, DBGHDR + newn)))
+		return p;
+	a->dbg = (dbgalloc *)q;		/* realloc may have moved the head */
+	return (char *)q + DBGHDR;
+#else
+	ablk *b = a->cur;
+	unsigned char *base = (unsigned char *)(b + 1);
+	if ((unsigned char *)p + oldn == base + b->used)
+		b->used = (size_t)((unsigned char *)p - base) + newn;
+	return p;
+#endif
+}
+
 /* ---------------------------------------------------------------- parser --- */
 
 typedef struct {
 	const unsigned char *b;	/* base, for offset arithmetic */
 	const unsigned char *p;
 	const unsigned char *end;
+	arena *a;
 	int depth;
 	json_err err;
 	size_t errpos;
@@ -114,40 +325,25 @@ static int fail(P *x, json_err e, const unsigned char *at)
 
 static json *node(P *x, json_type t)
 {
-	json *j = calloc(1, sizeof *j);
+	json *j = arena_alloc(x->a, sizeof *j, _Alignof(json));
 	if (!j) {
 		fail(x, JSON_ERR_NOMEM, x->p);
 		return NULL;
 	}
+	memset(j, 0, sizeof *j);	/* the calloc this replaced zeroed too */
 	j->type = t;
 	return j;
 }
 
+/* Only on a pointer json_parse() returned.  The root node is a member of the
+ * arena header, so stepping back by offsetof() reaches the arena that owns
+ * every node, string and vector under it, and one walk of the block list frees
+ * the lot.  Passing a subtree here is undefined; it was never meaningful. */
 void json_free(json *j)
 {
-	size_t i;
 	if (!j)
 		return;
-	switch (j->type) {
-	case JSON_STRING:
-		free(j->u.string.p);
-		break;
-	case JSON_ARRAY:
-		for (i = 0; i < j->u.array.len; i++)
-			json_free(j->u.array.v[i]);
-		free(j->u.array.v);
-		break;
-	case JSON_OBJECT:
-		for (i = 0; i < j->u.object.len; i++) {
-			free(j->u.object.v[i].key);
-			json_free(j->u.object.v[i].val);
-		}
-		free(j->u.object.v);
-		break;
-	default:
-		break;
-	}
-	free(j);
+	arena_destroy((arena *)(void *)((unsigned char *)j - offsetof(arena, root)));
 }
 
 /* RFC 8259 section 2: ws = *( %x20 / %x09 / %x0A / %x0D ).  Nothing else, so a
@@ -183,14 +379,18 @@ typedef struct { char *p; size_t len, cap; } buf;
 static int buf_room(P *x, buf *b, size_t n)
 {
 	size_t want = b->len + n + 1;	/* +1 for the terminator */
+	size_t cap = b->cap;
 	char *q;
-	if (want <= b->cap)
+	if (want <= cap)
 		return 0;
-	while (b->cap < want)
-		b->cap = b->cap ? b->cap * 2 : 16;
-	if (!(q = realloc(b->p, b->cap)))
+	while (cap < want)
+		cap = cap ? cap * 2 : 16;
+	/* oldn is the whole reservation, not the used length: arena_grow()
+	 * recognises the newest object by where its reservation ends. */
+	if (!(q = arena_grow(x->a, b->p, b->cap, cap, 1)))
 		return fail(x, JSON_ERR_NOMEM, x->p);
 	b->p = q;
+	b->cap = cap;
 	return 0;
 }
 
@@ -289,8 +489,9 @@ static int hex4(P *x, unsigned *out)
 	return 0;
 }
 
-/* On failure the buffer is freed and zeroed, so a caller that only checks the
- * return value cannot leak. */
+/* On failure the buffer is zeroed rather than freed: what it points at is
+ * arena memory and goes when the arena does.  A caller that only checks the
+ * return value still sees a NULL pointer and a zero length. */
 static int parse_string(P *x, buf *b)
 {
 	b->p = NULL;
@@ -391,9 +592,13 @@ static int parse_string(P *x, buf *b)
 	if (buf_room(x, b, 0) < 0)	/* guarantees p != NULL for "" */
 		goto bad;
 	b->p[b->len] = 0;
+	/* Give the doubling slack back.  Under -DJSONC_ARENA_DEBUG this is a
+	 * realloc down to the exact length, so a read one byte past the string
+	 * lands in a redzone instead of in the slack. */
+	b->p = arena_trim(x->a, b->p, b->cap, b->len + 1);
+	b->cap = b->len + 1;
 	return 0;
 bad:
-	free(b->p);
 	b->p = NULL;
 	b->len = b->cap = 0;
 	return -1;
@@ -500,18 +705,17 @@ static int parse_number(P *x, double *out)
 
 static json *parse_value(P *x);
 
-/* Takes ownership of key and val immediately, so every error path after this
- * point is just json_free() on the object. */
+/* Nothing here owns anything: the key, the value and the vector are all arena
+ * memory, so a failed allocation returns and the arena is destroyed whole. */
 static int obj_push(P *x, json *j, char *key, size_t klen, json *val)
 {
 	if (j->u.object.len == j->u.object.cap) {
 		size_t cap = j->u.object.cap ? j->u.object.cap * 2 : 8;
-		json_member *q = realloc(j->u.object.v, cap * sizeof *q);
-		if (!q) {
-			free(key);
-			json_free(val);
+		json_member *q = arena_grow(x->a, j->u.object.v,
+					    j->u.object.cap * sizeof *q,
+					    cap * sizeof *q, _Alignof(json_member));
+		if (!q)
 			return fail(x, JSON_ERR_NOMEM, x->p);
-		}
 		j->u.object.v = q;
 		j->u.object.cap = cap;
 	}
@@ -548,30 +752,26 @@ static json *parse_object(P *x)
 		json *v;
 		skip_ws(x);
 		if (parse_string(x, &k) < 0)
-			goto bad;
+			return NULL;
 		skip_ws(x);
 		if (x->p >= x->end) {
-			free(k.p);
 			fail(x, JSON_ERR_EOF, x->end);
-			goto bad;
+			return NULL;
 		}
 		if (*x->p != ':') {
-			free(k.p);
 			fail(x, JSON_ERR_COMMA, x->p);
-			goto bad;
+			return NULL;
 		}
 		x->p++;
 		skip_ws(x);
-		if (!(v = parse_value(x))) {
-			free(k.p);
-			goto bad;
-		}
+		if (!(v = parse_value(x)))
+			return NULL;
 		if (obj_push(x, j, k.p, k.len, v) < 0)
-			goto bad;
+			return NULL;
 		skip_ws(x);
 		if (x->p >= x->end) {
 			fail(x, JSON_ERR_EOF, x->end);
-			goto bad;
+			return NULL;
 		}
 		if (*x->p == ',') {
 			x->p++;
@@ -582,25 +782,30 @@ static json *parse_object(P *x)
 			return j;
 		}
 		fail(x, JSON_ERR_COMMA, x->p);
-		goto bad;
+		return NULL;
 	}
-bad:
-	json_free(j);
-	return NULL;
 }
 
 
-/* Doubling growth.  A failed realloc leaves the old block intact and the node
- * still owns it, so the caller's json_free() cleans up either way. */
+/* Doubling growth out of the arena.  A failed allocation leaves the old vector
+ * intact and the node still pointing at it, and the arena is destroyed whole
+ * on the way out, so there is nothing to undo here.
+ *
+ * shortcut: the superseded vector is abandoned in the arena rather than
+ * reused, so an n-element array costs about 2n slots at peak instead of n.
+ * The ceiling is memory, not correctness, and measured peak RSS still fell.
+ * The upgrade is a free list keyed by size class, or growing the vector in
+ * place by reserving ahead of it; neither is worth writing until a document
+ * exists that makes the 2n hurt. */
 static int arr_push(P *x, json *j, json *v)
 {
 	if (j->u.array.len == j->u.array.cap) {
 		size_t cap = j->u.array.cap ? j->u.array.cap * 2 : 8;
-		json **q = realloc(j->u.array.v, cap * sizeof *q);
-		if (!q) {
-			json_free(v);
+		json **q = arena_grow(x->a, j->u.array.v,
+				      j->u.array.cap * sizeof *q,
+				      cap * sizeof *q, _Alignof(json *));
+		if (!q)
 			return fail(x, JSON_ERR_NOMEM, x->p);
-		}
 		j->u.array.v = q;
 		j->u.array.cap = cap;
 	}
@@ -626,13 +831,13 @@ static json *parse_array(P *x)
 		json *v;
 		skip_ws(x);
 		if (!(v = parse_value(x)))
-			goto bad;
+			return NULL;
 		if (arr_push(x, j, v) < 0)
-			goto bad;
+			return NULL;
 		skip_ws(x);
 		if (x->p >= x->end) {
 			fail(x, JSON_ERR_EOF, x->end);
-			goto bad;
+			return NULL;
 		}
 		if (*x->p == ',') {
 			x->p++;
@@ -643,11 +848,8 @@ static json *parse_array(P *x)
 			return j;
 		}
 		fail(x, JSON_ERR_COMMA, x->p);
-		goto bad;
+		return NULL;
 	}
-bad:
-	json_free(j);
-	return NULL;
 }
 
 
@@ -663,10 +865,8 @@ static json *parse_value(P *x)
 		buf b;
 		if (parse_string(x, &b) < 0)
 			return NULL;
-		if (!(j = node(x, JSON_STRING))) {
-			free(b.p);
+		if (!(j = node(x, JSON_STRING)))
 			return NULL;
-		}
 		j->u.string.p = b.p;
 		j->u.string.len = b.len;
 		return j;
@@ -727,6 +927,13 @@ json_err json_parse(const void *buf, size_t len, json **out, size_t *errpos)
 	P x;
 	json *j;
 
+	*out = NULL;
+	if (!(x.a = arena_new())) {
+		if (errpos)
+			*errpos = 0;
+		return JSON_ERR_NOMEM;
+	}
+
 	/* NULL with len 0 is a legitimate call and `NULL + 0` is undefined
 	 * behaviour that UBSan reports, so substitute a real address. */
 	x.b = x.p = buf ? (const unsigned char *)buf : (const unsigned char *)"";
@@ -735,7 +942,6 @@ json_err json_parse(const void *buf, size_t len, json **out, size_t *errpos)
 	x.err = JSON_OK;
 	x.errpos = 0;
 
-	*out = NULL;
 	skip_ws(&x);
 	j = parse_value(&x);
 	if (j) {
@@ -744,12 +950,17 @@ json_err json_parse(const void *buf, size_t len, json **out, size_t *errpos)
 			fail(&x, JSON_ERR_TRAILING, x.p);
 	}
 	if (x.err != JSON_OK) {
-		json_free(j);
+		arena_destroy(x.a);
 		if (errpos)
 			*errpos = x.errpos;
 		return x.err;
 	}
-	*out = j;
+	/* The caller is handed the arena's own root slot, because that is the
+	 * only pointer from which json_free() can find the arena.  The node
+	 * parse_value() built is copied into it and then simply abandoned in the
+	 * arena, which costs one node per parse and no bookkeeping. */
+	x.a->root = *j;
+	*out = &x.a->root;
 	return JSON_OK;
 }
 
